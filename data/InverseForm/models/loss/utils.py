@@ -19,7 +19,7 @@ INVERSEFORM_MODULE = os.path.join("checkpoints", "distance_measures_regressor.pt
 
 
 def load_model_from_dict(model, pretrained):
-    pretrained_dict = torch.load(pretrained, map_location=torch.device('cpu'))
+    pretrained_dict = torch.load(pretrained, map_location=torch.device('cpu'), weights_only=False)
     model_dict = model.state_dict()
     updated_model_dict = {}
     for k_model, v_model in model_dict.items():

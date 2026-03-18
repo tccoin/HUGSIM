@@ -491,7 +491,8 @@ class HighResolutionNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
         if os.path.isfile(pretrained):
             pretrained_dict = torch.load(pretrained,
-                                         map_location={'cuda:0': 'cpu'})
+                                         map_location={'cuda:0': 'cpu'},
+                                         weights_only=False)
             logx.msg('=> loading pretrained model {}'.format(pretrained))
             model_dict = self.state_dict()
             pretrained_dict = {k.replace('last_layer',

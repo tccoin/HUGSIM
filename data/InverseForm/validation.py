@@ -142,7 +142,7 @@ def main(input_dir, output_dir, model_path, has_edge=False, model_summary=False,
     assert model_path is not None, 'need pytorch model for inference'
     
     #Load Network
-    checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+    checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
     logx.msg("Loading weights from: {}".format(model_path))
     net = models.get_net(arch, loss_fn)
     if fp16:
