@@ -13,3 +13,7 @@ apex
 # pixi environments
 .pixi
 *.egg-info
+*.log
+*.mp4
+*.wandb
+latest-run

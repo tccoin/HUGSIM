@@ -28,7 +28,30 @@ warm_start_params = ILQRWarmStartParameters(
 
 lqr = ILQRSolver(solver_params=solver_params, warm_start_params=warm_start_params)
 
-def plan2control(plan_traj, init_state):
+def plan2control(plan_traj, init_state, discretization_time=None):
+    global lqr, solver_params
+    if discretization_time is not None:
+        discretization_time = float(discretization_time)
+        if discretization_time <= 0.0:
+            raise ValueError("discretization_time must be positive")
+        if abs(discretization_time - solver_params.discretization_time) > 1e-9:
+            solver_params = ILQRSolverParameters(
+                discretization_time=discretization_time,
+                state_cost_diagonal_entries=solver_params.state_cost_diagonal_entries,
+                input_cost_diagonal_entries=solver_params.input_cost_diagonal_entries,
+                state_trust_region_entries=solver_params.state_trust_region_entries,
+                input_trust_region_entries=solver_params.input_trust_region_entries,
+                max_ilqr_iterations=solver_params.max_ilqr_iterations,
+                convergence_threshold=solver_params.convergence_threshold,
+                max_solve_time=solver_params.max_solve_time,
+                max_acceleration=solver_params.max_acceleration,
+                max_steering_angle=solver_params.max_steering_angle,
+                max_steering_angle_rate=solver_params.max_steering_angle_rate,
+                min_velocity_linearization=solver_params.min_velocity_linearization,
+                wheelbase=solver_params.wheelbase,
+            )
+            lqr = ILQRSolver(solver_params=solver_params,
+                             warm_start_params=warm_start_params)
     current_state = init_state
     solutions = lqr.solve(current_state, plan_traj)
     optimal_inputs = solutions[-1].input_trajectory

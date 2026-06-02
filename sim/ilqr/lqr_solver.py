@@ -119,6 +119,8 @@ class ILQRWarmStartParameters:
     k_lateral_error: float  # Gain for lateral error to compute steering angle feedback.
     jerk_penalty_warm_start_fit: float  # Penalty for jerk in velocity profile estimation.
     curvature_rate_penalty_warm_start_fit: float  # Penalty for curvature rate in curvature profile estimation.
+    use_current_steer_for_warm_start: bool = True
+    steering_tracking_tau: float = 0.35
 
     def __post_init__(self) -> None:
         """Ensure entries lie in expected bounds."""
@@ -129,6 +131,7 @@ class ILQRWarmStartParameters:
             "k_lateral_error",
             "jerk_penalty_warm_start_fit",
             "curvature_rate_penalty_warm_start_fit",
+            "steering_tracking_tau",
         ]:
             assert getattr(self, entry) > 0.0, f"Field {entry} should be positive."
 
@@ -392,6 +395,36 @@ class ILQRSolver:
         steering_angle = steering_angle_sign * min(abs(steering_angle), self._solver_params.max_steering_angle)
         return steering_angle
 
+    def _make_steering_rate_profile_from_current_steer(
+        self,
+        current_steer: float,
+        steering_target_profile: DoubleMatrix,
+        n_inputs: int,
+    ) -> DoubleMatrix:
+        """Roll out steering-rate warm start from the actual current steering."""
+        steering_target_profile = np.asarray(
+            steering_target_profile, dtype=np.float64
+        ).reshape(-1)
+        assert steering_target_profile.shape[0] > 0, "Expected non-empty steering target profile."
+
+        dt = max(float(self._solver_params.discretization_time), 1e-6)
+        tau = max(float(self._warm_start_params.steering_tracking_tau), dt)
+        max_rate = float(self._solver_params.max_steering_angle_rate)
+
+        steer = float(current_steer)
+        rates = np.zeros((n_inputs,), dtype=np.float64)
+        for k in range(n_inputs):
+            target_idx = min(k, steering_target_profile.shape[0] - 1)
+            target_steer = self._clip_steering_angle(
+                float(steering_target_profile[target_idx])
+            )
+            rate = (target_steer - steer) / tau
+            rate = float(np.clip(rate, -max_rate, max_rate))
+            rates[k] = rate
+            steer = self._clip_steering_angle(steer + rate * dt)
+
+        return rates
+
     def _input_warm_start(self, current_state: DoubleMatrix, reference_trajectory: DoubleMatrix) -> ILQRIterate:
         """
         Given a reference trajectory, we generate the warm start (initial guess) by inferring the inputs applied based
@@ -417,20 +450,28 @@ class ILQRSolver:
         acceleration_feedback = -self._warm_start_params.k_velocity_error_feedback * (
             velocity_current - velocity_reference
         )
+        reference_inputs_completed[0, 0] += acceleration_feedback
 
         steering_angle_feedback = compute_steering_angle_feedback(
-            pose_reference=current_state[:3],
-            pose_current=reference_states_completed[0, :3],
+            pose_reference=reference_states_completed[0, :3],
+            pose_current=current_state[:3],
             lookahead_distance=self._warm_start_params.lookahead_distance_lateral_error,
             k_lateral_error=self._warm_start_params.k_lateral_error,
         )
-        steering_angle_desired = steering_angle_feedback + steering_angle_reference
-        steering_rate_feedback = -self._warm_start_params.k_steering_angle_error_feedback * (
-            steering_angle_current - steering_angle_desired
-        )
-
-        reference_inputs_completed[0, 0] += acceleration_feedback
-        reference_inputs_completed[0, 1] += steering_rate_feedback
+        if self._warm_start_params.use_current_steer_for_warm_start:
+            steering_target_profile = reference_states_completed[:, 4].copy()
+            steering_target_profile[0] = steering_angle_reference + steering_angle_feedback
+            reference_inputs_completed[:, 1] = self._make_steering_rate_profile_from_current_steer(
+                current_steer=steering_angle_current,
+                steering_target_profile=steering_target_profile,
+                n_inputs=reference_inputs_completed.shape[0],
+            )
+        else:
+            steering_angle_desired = steering_angle_feedback + steering_angle_reference
+            steering_rate_feedback = -self._warm_start_params.k_steering_angle_error_feedback * (
+                steering_angle_current - steering_angle_desired
+            )
+            reference_inputs_completed[0, 1] += steering_rate_feedback
 
         # We rerun dynamics with constraints applied to make sure we have a feasible warm start for iLQR.
         return self._run_forward_dynamics(current_state, reference_inputs_completed)

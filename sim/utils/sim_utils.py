@@ -50,24 +50,53 @@ def create_cam(intrinsic, c2w):
                 image=np.zeros((h, w, 3)), image_name='')
     return cam
 
-def traj2control(plan_traj, info):
+def traj2control(plan_traj, info, discretization_time=None):
+    """Convert a planned trajectory into a single (acc, steer_rate) command
+    via the iLQR tracker.
+
+    plan_traj:
+      shape (N, 2) → legacy [x_right_lidar, y_forward_lidar] — heading is
+                     derived from consecutive XY diffs.
+      shape (N, 3) → [x_right_lidar, y_forward_lidar, heading_navsim_imu]
+                     — heading is taken directly from the agent (drivoR
+                     etc.) and converted to iLQR's right-handed convention
+                     by negation (NAVSIM y=left, iLQR y=right).
+
+    iLQR state convention (per lqr_solver.py):
+      dx = v*cos(θ)*dt, dy = v*sin(θ)*dt
+      → θ = 0 means motion along +x = +forward, θ = +π/2 means motion
+      along +y = +right_lidar. So heading_iLQR is "CCW from forward, with
+      y-axis pointing right".
+
+    Earlier this function used the wrong coordinate order for 2-D plans;
+    the fallback below follows HUGSIM PR #57.
     """
-        The input plan trajectory is under lidar coordinates
-        x to right, y to forward and z to upward
-    """
-    plan_traj_stats = np.zeros((plan_traj.shape[0]+1, 5))
-    plan_traj_stats[1:, :2] = plan_traj[:, [1,0]]
-    prev_a, prev_b = 0.0, 0.0
-    for i, (a, b) in enumerate(plan_traj):
-        rot = np.arctan2(b - prev_b, a - prev_a)
-        rot = np.where(rot > np.pi/2, rot - np.pi, rot)
-        rot = np.where(rot < -np.pi/2, rot + np.pi, rot)
-        plan_traj_stats[i+1, 2] = rot
-        prev_a, prev_b = a, b
+    plan_traj = np.asarray(plan_traj, dtype=np.float64)
+    n_pts = plan_traj.shape[0]
+    plan_traj_stats = np.zeros((n_pts + 1, 5))
+    # (x_right_lidar, y_forward_lidar) → iLQR (x_forward, y_right)
+    plan_traj_stats[1:, :2] = plan_traj[:, [1, 0]]
+
+    if plan_traj.shape[1] >= 3:
+        # Heading provided by agent in NAVSIM IMU convention
+        # (forward=0, CCW, y=left). iLQR's y is right → negate.
+        plan_traj_stats[1:, 2] = -plan_traj[:, 2]
+    else:
+        # Legacy 2-D plan: derive heading from XY diffs using HUGSIM PR #57's
+        # coordinate order. iLQR heading is atan2(right, forward).
+        prev_a, prev_b = 0.0, 0.0
+        for i, (b, a) in enumerate(plan_traj):
+            rot = np.arctan2(b - prev_b, a - prev_a)
+            rot = np.where(rot > np.pi / 2, rot - np.pi, rot)
+            rot = np.where(rot < -np.pi / 2, rot + np.pi, rot)
+            plan_traj_stats[i + 1, 2] = rot
+            prev_a, prev_b = a, b
+
     curr_stat = np.array(
         [0.0, 0.0, 0.0, info['ego_velo'], info['ego_steer']]
     )
-    acc, steer_rate = plan2control(plan_traj_stats, curr_stat)
+    acc, steer_rate = plan2control(
+        plan_traj_stats, curr_stat, discretization_time=discretization_time)
     return acc, steer_rate
 
 def dense_cam_poses(cam_poses, cmds):
