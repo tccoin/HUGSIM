@@ -9,6 +9,7 @@ from scipy.spatial.transform import Rotation as SCR
 from sim.utils.score_calculator import create_rectangle, bg_collision_det
 import os
 import pickle
+import json
 from sim.utils.plan import planner, UnifiedMap
 from omegaconf import OmegaConf
 import math
@@ -20,6 +21,77 @@ import open3d as o3d
 
 def _focal2fov(focal, pixels):
     return 2.0 * math.atan(float(pixels) / (2.0 * float(focal)))
+
+
+FLU_TO_RDF = np.array(
+    [[0, -1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0], [0, 0, 0, 1]],
+    dtype=np.float64,
+)
+
+
+def _quat_wxyz_to_mat(q):
+    w = float(q["w"])
+    x = float(q["x"])
+    y = float(q["y"])
+    z = float(q["z"])
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    if n == 0.0:
+        return np.eye(3, dtype=np.float64)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rotvec_to_mat(wx, wy, wz):
+    vec = np.array([wx, wy, wz], dtype=np.float64)
+    theta = float(np.linalg.norm(vec))
+    if theta < 1e-10:
+        return np.eye(3, dtype=np.float64)
+    axis = vec / theta
+    x, y, z = axis
+    skew = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=np.float64)
+    return np.eye(3, dtype=np.float64) + math.sin(theta) * skew + (1.0 - math.cos(theta)) * (skew @ skew)
+
+
+def _load_gaia_pose_sv(camera_info_dir, camera_name):
+    path = os.path.join(str(camera_info_dir), f"{camera_name}.json")
+    with open(path, "r") as f:
+        data = json.load(f)
+    ext = data["calibration"]["extrinsics"]["transform_VS"]
+    rot = _quat_wxyz_to_mat(ext["so3"])
+    rot = rot @ _rotvec_to_mat(0.0, 0.0, math.pi / 2.0) @ _rotvec_to_mat(0.0, -math.pi / 2.0, 0.0)
+    pose_vs = np.eye(4, dtype=np.float64)
+    pose_vs[:3, :3] = rot
+    pose_vs[:3, 3] = np.asarray(ext["translation"]["matrix"][0], dtype=np.float64)
+    return FLU_TO_RDF @ np.linalg.inv(pose_vs)
+
+
+def _load_gaia_pinhole_intrinsic(camera_info_dir, camera_name, image_size):
+    path = os.path.join(str(camera_info_dir), f"{camera_name}.json")
+    with open(path, "r") as f:
+        data = json.load(f)
+    matrix = data["calibration"]["intrinsics"]["camera_model"]["pinhole_parameters"]["matrix_image_camera"]["matrix"]
+    target_w, target_h = int(image_size[0]), int(image_size[1])
+    sx = target_w / max(float(data["width"]), 1.0)
+    sy = target_h / max(float(data["height"]), 1.0)
+    fx = float(matrix[0][0]) * sx
+    fy = float(matrix[1][1]) * sy
+    cx = float(matrix[2][0]) * sx
+    cy = float(matrix[2][1]) * sy
+    return {
+        'H': target_h,
+        'W': target_w,
+        'fovx': _focal2fov(fx, target_w),
+        'fovy': _focal2fov(fy, target_h),
+        'cx': cx,
+        'cy': cy,
+    }
 
 
 def fg_collision_det(ego_box, objs):
@@ -91,7 +163,6 @@ class HUGSimEnv(gymnasium.Env):
                 sg_config=str(sg_cfg.config),
                 sg_model_path=str(sg_cfg.model_path),
                 sg_data_path=str(sg_cfg.data_path),
-                sg_cameras=list(sg_cfg.get('cameras', [0])),
                 include_sky=bool(sg_cfg.get('include_sky', False)),
             )
             self.ground_model = self._build_ground_model_from_sg()
@@ -308,8 +379,8 @@ class HUGSimEnv(gymnasium.Env):
     def _build_ground_model_from_sg(self):
         """Reconstruct (cam_poses, cam_heights, commands) from SG's training cameras.
 
-        - cam_poses: (N,4,4) c2w in HUGSIM world. We take only front-camera
-          training poses (cam_id=0), sorted by timestamp, and convert from
+        - cam_poses: (N,4,4) c2w in HUGSIM world. We take only CAM_FRONT
+          training poses, sorted by timestamp, and convert from
           SG world to HUGSIM world via inv(T_hugsim_to_sg).
         - cam_heights: scalar — height of the camera above the road. Estimated
           from cam_pose translation Y (HUGSIM Y points DOWN, so positive Y is
@@ -322,9 +393,10 @@ class HUGSimEnv(gymnasium.Env):
         T_h2s = sgb.T_hugsim_to_sg
         T_s2h = np.linalg.inv(T_h2s)
 
+        front_cam_id = sgb.cam_id_for_name('CAM_FRONT')
         front_cams = []
         for cam in sgb.train_cams:
-            if cam.meta.get('cam', -1) == 0:
+            if cam.meta.get('cam', -1) == front_cam_id:
                 front_cams.append(cam)
         if not front_cams:
             front_cams = list(sgb.train_cams)
@@ -449,6 +521,16 @@ class HUGSimEnv(gymnasium.Env):
         if bgr is None:
             raise FileNotFoundError(f"Failed to read GT image for open-loop mode: {path}")
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        K = cam.K.detach().cpu().numpy() if hasattr(cam.K, 'detach') else np.asarray(cam.K)
+        src_h, src_w = rgb.shape[:2]
+        crop_w = min(src_w, int(round(2.0 * float(K[0, 0]) * math.tan(float(intrinsic['fovx']) / 2.0))))
+        crop_h = min(src_h, int(round(2.0 * float(K[1, 1]) * math.tan(float(intrinsic['fovy']) / 2.0))))
+        if crop_w > 0 and crop_h > 0 and (crop_w < src_w or crop_h < src_h):
+            cx = float(K[0, 2])
+            cy = float(K[1, 2])
+            x0 = max(0, min(src_w - crop_w, int(round(cx - crop_w / 2.0))))
+            y0 = max(0, min(src_h - crop_h, int(round(cy - crop_h / 2.0))))
+            rgb = rgb[y0:y0 + crop_h, x0:x0 + crop_w]
         H, W = int(intrinsic['H']), int(intrinsic['W'])
         if rgb.shape[:2] != (H, W):
             rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_LINEAR)
@@ -464,11 +546,7 @@ class HUGSimEnv(gymnasium.Env):
             H, W = int(intrinsic['H']), int(intrinsic['W'])
             rgb = None
             if params.get('sg_render', True):
-                sg_cam_id = {
-                    'CAM_FRONT': 0,
-                    'CAM_FRONT_LEFT': 1,
-                    'CAM_FRONT_RIGHT': 2,
-                }.get(cam_name)
+                sg_cam_id = self.sg_backend.cam_id_for_name(cam_name)
                 if sg_cam_id is not None:
                     cam = self._find_sg_train_cam(frame_idx, sg_cam_id)
                     if cam is not None:
@@ -491,10 +569,11 @@ class HUGSimEnv(gymnasium.Env):
 
     def sg_log_time_bounds(self, fps=10.0):
         assert self.sg_backend is not None, "sg_log_time_bounds requires SG mode"
+        front_cam_id = self.sg_backend.cam_id_for_name('CAM_FRONT')
         frames = [
             int(cam.meta.get('frame_idx', 0))
             for cam in self.sg_backend.train_cams
-            if cam.meta.get('cam', -1) == 0
+            if cam.meta.get('cam', -1) == front_cam_id
         ]
         if not frames:
             return 0.0, 0.0
@@ -510,7 +589,8 @@ class HUGSimEnv(gymnasium.Env):
         info['collision'] = False
         info['bg_collision'] = False
         info['fg_collision'] = False
-        info['off_route'] = bool(dist > 15)
+        off_route_threshold = float(getattr(self, 'off_route_threshold', 30.0))
+        info['off_route'] = bool(dist > off_route_threshold)
         info['route_complete'] = False
         info['open_loop'] = True
         return observation, info
@@ -532,6 +612,60 @@ class HUGSimEnv(gymnasium.Env):
             'cy': cy,
         }
 
+    def _front_tele_intrinsic(self, image_size, hfov_degrees=30.0):
+        target_w, target_h = int(image_size[0]), int(image_size[1])
+        hfov = math.radians(float(hfov_degrees))
+        focal = target_w / (2.0 * math.tan(hfov / 2.0))
+        return {
+            'H': target_h,
+            'W': target_w,
+            'fovx': hfov,
+            'fovy': _focal2fov(focal, target_h),
+            'cx': target_w / 2.0,
+            'cy': target_h / 2.0,
+        }
+
+    def _pinhole_intrinsic_from_hfov(self, image_size, hfov_degrees):
+        target_w, target_h = int(image_size[0]), int(image_size[1])
+        hfov = math.radians(float(hfov_degrees))
+        focal = target_w / (2.0 * math.tan(hfov / 2.0))
+        return {
+            'H': target_h,
+            'W': target_w,
+            'fovx': hfov,
+            'fovy': _focal2fov(focal, target_h),
+            'cx': target_w / 2.0,
+            'cy': target_h / 2.0,
+        }
+
+    def _requested_sg_native_camera_names(self, camera_cfg):
+        camera_names = list(camera_cfg.get('camera_names', []))
+        if not camera_names:
+            camera_names = list(camera_cfg.get('cameras', []))
+        if not camera_names:
+            for row in camera_cfg.get('cam_align', []):
+                camera_names.extend(list(row))
+        if not camera_names:
+            camera_names = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT']
+
+        unique = []
+        for cam_name in camera_names:
+            cam_name = str(cam_name)
+            if cam_name not in unique:
+                unique.append(cam_name)
+        return unique
+
+    def _sg_native_cam_align(self, camera_cfg, camera_names, cam_params):
+        rows = camera_cfg.get('cam_align', [])
+        cam_align = [
+            [str(cam_name) for cam_name in row if str(cam_name) in cam_params]
+            for row in rows
+        ]
+        cam_align = [row for row in cam_align if row]
+        if not cam_align:
+            cam_align = [[cam_name for cam_name in camera_names if cam_name in cam_params]]
+        return cam_align
+
     def _load_sg_native_camera_cfg(self, camera_cfg):
         """Build camera params from the active SG scene's frame-0 training rig.
 
@@ -543,34 +677,130 @@ class HUGSimEnv(gymnasium.Env):
         """
         image_size = camera_cfg.get('image_size', [1152, 672])
         frame_idx = int(camera_cfg.get('frame_idx', 0))
-        name_to_sg = {
-            'CAM_FRONT': 0,
-            'CAM_FRONT_LEFT': 1,
-            'CAM_FRONT_RIGHT': 2,
-        }
-        front_cam = self._find_sg_train_cam(frame_idx, 0)
-        assert front_cam is not None, 'SG native camera config requires cam=0'
+        camera_names = self._requested_sg_native_camera_names(camera_cfg)
+        if 'CAM_FRONT' not in camera_names:
+            raise ValueError('SG native camera config requires CAM_FRONT as the reference camera')
+        front_sg_id = self.sg_backend.cam_id_for_name('CAM_FRONT')
+        front_cam = self._find_sg_train_cam(frame_idx, front_sg_id)
+        assert front_cam is not None, 'SG native camera config requires CAM_FRONT'
         front_c2w = self._sg_cam_c2w_hugsim(front_cam)
+        agent_sg_native = camera_cfg.get('agent_sg_native', {})
+        pai_hfov_deg = agent_sg_native.get('pai_rectified_hfov_deg', None)
+        use_dataset_cam_to_vehicle = bool(agent_sg_native.get('use_dataset_cam_to_vehicle', False))
+        legacy_render_gaia_rig = bool(agent_sg_native.get('render_gaia_rig', False))
+        rig_mode = str(agent_sg_native.get('rig_mode', '')).strip().lower()
+        if not rig_mode:
+            rig_mode = 'gaia' if legacy_render_gaia_rig else 'hugsim'
+        if rig_mode not in ('hugsim', 'gaia'):
+            raise ValueError("agent_sg_native.rig_mode must be 'hugsim' or 'gaia'")
+        use_gaia_rig = rig_mode == 'gaia'
+        intrinsics_mode = str(agent_sg_native.get('intrinsics_mode', '')).strip().lower()
+        if intrinsics_mode not in ('', 'hugsim', 'gaia'):
+            raise ValueError("agent_sg_native.intrinsics_mode must be 'hugsim' or 'gaia'")
+        render_gaia_pinhole_intrinsics = bool(agent_sg_native.get('render_gaia_pinhole_intrinsics', False))
+        gaia_pinhole_intrinsic_cameras = agent_sg_native.get('gaia_pinhole_intrinsic_cameras', None)
+        if gaia_pinhole_intrinsic_cameras is not None:
+            gaia_pinhole_intrinsic_cameras = {str(cam_name) for cam_name in gaia_pinhole_intrinsic_cameras}
+        gaia_camera_info_dir = agent_sg_native.get('gaia_camera_info_dir', None)
+        gaia_camera_map = agent_sg_native.get('gaia_camera_map', {})
+        if intrinsics_mode == 'gaia':
+            uses_gaia_intrinsics = True
+            gaia_pinhole_intrinsic_cameras = None
+        elif intrinsics_mode == 'hugsim':
+            uses_gaia_intrinsics = False
+        else:
+            uses_gaia_intrinsics = render_gaia_pinhole_intrinsics
+        if use_gaia_rig or uses_gaia_intrinsics:
+            if gaia_camera_info_dir is None:
+                raise ValueError(
+                    'rig_mode=gaia/intrinsics_mode=gaia require '
+                    'agent_sg_native.gaia_camera_info_dir'
+                )
+            gaia_camera_map = {
+                'CAM_FRONT': 'front_wide',
+                'CAM_FRONT_TELE': 'front_tele',
+                'CAM_FRONT_LEFT': 'left_side_forward',
+                'CAM_FRONT_RIGHT': 'right_side_forward',
+                **dict(gaia_camera_map),
+            }
+            if use_gaia_rig:
+                gaia_pose_sv = {
+                    gaia_name: _load_gaia_pose_sv(gaia_camera_info_dir, gaia_name)
+                    for gaia_name in set(gaia_camera_map.values())
+                }
+                front_pose_sv = gaia_pose_sv[gaia_camera_map['CAM_FRONT']]
+            else:
+                gaia_pose_sv = {}
+                front_pose_sv = None
+        else:
+            gaia_camera_map = {}
+            gaia_pose_sv = {}
+            front_pose_sv = None
 
         cam_params = {}
-        v2front = np.eye(4, dtype=np.float64)
-        for cam_name, sg_id in name_to_sg.items():
-            cam = self._find_sg_train_cam(frame_idx, sg_id)
-            assert cam is not None, f'SG native camera config requires cam={sg_id}'
-            cam_c2w = self._sg_cam_c2w_hugsim(cam)
-            cam_to_front = np.linalg.inv(front_c2w) @ cam_c2w
+        dataset_type = getattr(self.sg_backend, 'dataset_type', '')
+        for cam_name in camera_names:
+            if cam_name == 'CAM_BACK':
+                continue
+            cam = None
+            sg_id = self.sg_backend.cam_id_for_name(cam_name)
+            synthesize_front_tele = (
+                cam_name == 'CAM_FRONT_TELE'
+                and (sg_id is None or sg_id == front_sg_id)
+            )
+            if synthesize_front_tele:
+                cam = front_cam
+                cam_c2w = front_c2w
+                intrinsic = self._front_tele_intrinsic(image_size)
+            else:
+                if sg_id is None:
+                    available = ', '.join(self.sg_backend.available_camera_names())
+                    raise ValueError(
+                        f'SG native camera config requested unsupported camera {cam_name}. '
+                        f'Available SG camera names: {available}'
+                    )
+                cam = self._find_sg_train_cam(frame_idx, sg_id)
+                if cam is None:
+                    available = ', '.join(self.sg_backend.available_camera_names())
+                    raise ValueError(
+                        f'SG native camera config requested {cam_name}, but the SG scene '
+                        f'has no matching training camera. Available SG camera names: {available}'
+                    )
+                cam_c2w = self._sg_cam_c2w_hugsim(cam)
+                intrinsic = self._intrinsic_from_sg_cam(cam, image_size)
+                if dataset_type == 'pai' and pai_hfov_deg is not None:
+                    intrinsic = self._pinhole_intrinsic_from_hfov(image_size, pai_hfov_deg)
+            gaia_name = gaia_camera_map.get(cam_name)
+            use_gaia_pinhole_intrinsic = (
+                uses_gaia_intrinsics
+                and gaia_name is not None
+                and (
+                    gaia_pinhole_intrinsic_cameras is None
+                    or cam_name in gaia_pinhole_intrinsic_cameras
+                )
+            )
+            if use_gaia_pinhole_intrinsic:
+                intrinsic = _load_gaia_pinhole_intrinsic(gaia_camera_info_dir, gaia_name, image_size)
+            if use_gaia_rig and gaia_name is not None:
+                cam_to_front = front_pose_sv @ np.linalg.inv(gaia_pose_sv[gaia_name])
+            else:
+                cam_to_front = np.linalg.inv(front_c2w) @ cam_c2w
             v2c = np.linalg.inv(cam_to_front)
             cam_params[cam_name] = {
-                'intrinsic': self._intrinsic_from_sg_cam(cam, image_size),
+                'intrinsic': intrinsic,
                 'v2c': v2c,
                 'l2c': v2c.copy(),
                 'sg_render': True,
             }
+            if use_dataset_cam_to_vehicle and cam is not None:
+                cam_params[cam_name]['agent_cam_to_vehicle'] = np.asarray(
+                    cam.extrinsic, dtype=np.float64
+                ).copy()
 
         # Waymo perception SG scenes have no rear training camera. Keep a
         # black rear slot with a valid placeholder K/extrinsic so drivoR's
         # fixed four-camera input contract stays satisfied.
-        if bool(camera_cfg.get('include_black_back', True)):
+        if 'CAM_BACK' in camera_names and bool(camera_cfg.get('include_black_back', True)):
             back_v2c = np.eye(4, dtype=np.float64)
             back_v2c[:3, :3] = SCR.from_euler('Y', 180.0, degrees=True).as_matrix()
             cam_params['CAM_BACK'] = {
@@ -580,10 +810,7 @@ class HUGSimEnv(gymnasium.Env):
                 'sg_render': False,
             }
 
-        cam_align = [
-            ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT'],
-            ['CAM_BACK'] if 'CAM_BACK' in cam_params else [],
-        ]
+        cam_align = self._sg_native_cam_align(camera_cfg, camera_names, cam_params)
         return cam_params, cam_align, np.eye(4, dtype=np.float64)
 
     def sg_start_pose_at_time(self, t_sec, fps=10.0):
@@ -598,21 +825,22 @@ class HUGSimEnv(gymnasium.Env):
         assert self.sg_backend is not None, "sg_start_pose_at_time requires SG mode"
         frame_idx = int(round(float(t_sec) * float(fps)))
         sgb = self.sg_backend
+        front_cam_id = sgb.cam_id_for_name('CAM_FRONT')
         front_cam = None
         for cam in sgb.train_cams:
-            if cam.meta.get('frame_idx', -1) == frame_idx and cam.meta.get('cam', -1) == 0:
+            if cam.meta.get('frame_idx', -1) == frame_idx and cam.meta.get('cam', -1) == front_cam_id:
                 front_cam = cam
                 break
         if front_cam is None:
             # fall back to nearest available front-cam frame
             best, best_d = None, 1e9
             for cam in sgb.train_cams:
-                if cam.meta.get('cam', -1) != 0:
+                if cam.meta.get('cam', -1) != front_cam_id:
                     continue
                 d = abs(int(cam.meta.get('frame_idx', -1)) - frame_idx)
                 if d < best_d:
                     best, best_d = cam, d
-            assert best is not None, "No SG front-cam (cam=0) frames available"
+            assert best is not None, "No SG CAM_FRONT frames available"
             print(f"[hug_sim] sg_start_pose_at_time({t_sec}s, frame={frame_idx}): "
                   f"no exact match, using nearest frame_idx={best.meta['frame_idx']}")
             front_cam = best
@@ -640,8 +868,9 @@ class HUGSimEnv(gymnasium.Env):
         assert self.sg_backend is not None, "sg_log_speed_at_time requires SG mode"
         target_idx = int(round(float(t_sec) * float(fps)))
         sgb = self.sg_backend
-        front = [cam for cam in sgb.train_cams if cam.meta.get('cam', -1) == 0]
-        assert front, "No SG front-cam (cam=0) frames available"
+        front_cam_id = sgb.cam_id_for_name('CAM_FRONT')
+        front = [cam for cam in sgb.train_cams if cam.meta.get('cam', -1) == front_cam_id]
+        assert front, "No SG CAM_FRONT frames available"
         front.sort(key=lambda cam: int(cam.meta.get('frame_idx', -1)))
 
         best_i = min(
@@ -733,14 +962,15 @@ class HUGSimEnv(gymnasium.Env):
 
         rc, dist = self.route_completion
         off_route = False
-        if dist > 15:
+        off_route_threshold = float(getattr(self, 'off_route_threshold', 30.0))
+        if dist > off_route_threshold:
             terminated = True
             off_route = True
             print('Far from preset trajectory')
 
         # No route_complete termination: rc is still reported in info for
         # eval, but reaching rc>=1 no longer ends the sim. Termination only
-        # fires on collision or off-route (>15m from the log trajectory).
+        # fires on collision or off-route from the log trajectory.
 
         observation = self._get_obs()
         info = self._get_info()
@@ -906,7 +1136,8 @@ class HUGSimEnv(gymnasium.Env):
 
         rc, dist = self.route_completion
         off_route = False
-        if dist > 15:
+        off_route_threshold = float(getattr(self, 'off_route_threshold', 30.0))
+        if dist > off_route_threshold:
             terminated = True
             off_route = True
             print('Far from preset trajectory')
