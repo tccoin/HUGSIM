@@ -121,6 +121,12 @@ class HUGSimEnv(gymnasium.Env):
         sg_cfg = cfg.get('sg', None) if hasattr(cfg, 'get') else None
         self.sg_enabled = bool(sg_cfg is not None and sg_cfg.get('enabled', False))
         self.sg_backend = None
+        self._use_exact_ego_pose = bool(sg_cfg.get('use_exact_ego_pose', False)) if self.sg_enabled else False
+        self._use_alpasim_controller_absolute_pose = (
+            bool(sg_cfg.get('use_controller_absolute_pose', True))
+            if self.sg_enabled else True
+        )
+        self._exact_ego_pose = None
 
         if not self.sg_enabled:
             # ── Legacy HUGSIM scene path ─────────────────────────────────
@@ -152,20 +158,39 @@ class HUGSimEnv(gymnasium.Env):
             self.gaussians = None  # SG-only mode owns its own gaussians
 
         if self.sg_enabled:
-            # Initialise SG render backend; build SG-derived ground_model.
-            # Lazy import so the legacy hugsim env doesn't pay SG's deps at import time.
+            # Initialise external render backend; build derived ground_model.
+            # Lazy import so the legacy hugsim env doesn't pay renderer deps at import time.
             import sys
             sys.path.insert(0, os.path.abspath(os.path.join(
                 os.path.dirname(__file__), '..', '..', '..', '..', '..')))
-            from gs_world.simulation.sg_render_backend import SGRenderBackend
-            self.sg_backend = SGRenderBackend(
-                sg_root=str(sg_cfg.root),
-                sg_config=str(sg_cfg.config),
-                sg_model_path=str(sg_cfg.model_path),
-                sg_data_path=str(sg_cfg.data_path),
-                include_sky=bool(sg_cfg.get('include_sky', False)),
-            )
-            self.ground_model = self._build_ground_model_from_sg()
+            backend_name = str(sg_cfg.get('backend', 'sg')).lower()
+            if backend_name == 'alpasim':
+                from gs_world.simulation.alpasim_render_backend import AlpaSimRenderBackend
+                self.sg_backend = AlpaSimRenderBackend(
+                    renderer_address=str(sg_cfg.renderer_address),
+                    scene_id=str(sg_cfg.scene_id),
+                    usdz_path=str(sg_cfg.usdz_path),
+                    alpasim_src=str(sg_cfg.get('alpasim_src', '')),
+                    insert_ego_mask=bool(sg_cfg.get('insert_ego_mask', True)),
+                    ego_mask_rig_config_id=str(
+                        sg_cfg.get('ego_mask_rig_config_id', 'hyperion_8')),
+                    render_intrinsics=str(sg_cfg.get('render_intrinsics', 'native')),
+                    time_origin_offset_s=float(sg_cfg.get('time_origin_offset_s', 0.0)),
+                    timeout_s=float(sg_cfg.get('timeout_s', 60.0)),
+                )
+            else:
+                from gs_world.simulation.sg_render_backend import SGRenderBackend
+                self.sg_backend = SGRenderBackend(
+                    sg_root=str(sg_cfg.root),
+                    sg_config=str(sg_cfg.config),
+                    sg_model_path=str(sg_cfg.model_path),
+                    sg_data_path=str(sg_cfg.data_path),
+                    include_sky=bool(sg_cfg.get('include_sky', False)),
+                )
+            if hasattr(self.sg_backend, 'build_ground_model_hugsim'):
+                self.ground_model = self.sg_backend.build_ground_model_hugsim()
+            else:
+                self.ground_model = self._build_ground_model_from_sg()
 
         """
         plan_list: a, b, height, yaw, v, model_path, controller, params
@@ -195,7 +220,10 @@ class HUGSimEnv(gymnasium.Env):
             # confidence threshold; ground points come from the ground_model
             # cam poses (driving surface) instead of a semantic gaussian split,
             # because SG doesn't tag points with HUGSIM's semantic classes.
-            ground_xyz, scene_xyz = self._extract_pointclouds_from_sg()
+            if hasattr(self.sg_backend, 'extract_pointclouds_hugsim'):
+                ground_xyz, scene_xyz = self.sg_backend.extract_pointclouds_hugsim()
+            else:
+                ground_xyz, scene_xyz = self._extract_pointclouds_from_sg()
 
         ground_pcd = o3d.geometry.PointCloud()
         ground_pcd.points = o3d.utility.Vector3dVector(ground_xyz.astype(float))
@@ -282,7 +310,11 @@ class HUGSimEnv(gymnasium.Env):
                 "unicycles": {},
             }
             # Collision points from SG gaussians (SG world frame → HUGSIM world).
-            self.points = self._extract_collision_points_sg()
+            if hasattr(self.sg_backend, 'extract_collision_points_hugsim'):
+                collision_points = self.sg_backend.extract_collision_points_hugsim()
+                self.points = torch.from_numpy(collision_points.astype(np.float32)).cuda()
+            else:
+                self.points = self._extract_collision_points_sg()
 
         self.last_accel = 0
         self.last_steer_rate = 0
@@ -323,6 +355,8 @@ class HUGSimEnv(gymnasium.Env):
     
     @property
     def ego(self):
+        if self._use_exact_ego_pose and self._exact_ego_pose is not None:
+            return np.asarray(self._exact_ego_pose, dtype=np.float64)
         return rt2pose(self.vr, self.vt)
     
     @property
@@ -559,7 +593,20 @@ class HUGSimEnv(gymnasium.Env):
         return {'rgb': rgbs, 'semantic': semantics, 'depth': depths}
 
     def _set_sg_state_at_time(self, t_sec, fps=10.0):
-        vab, vr = self.sg_start_pose_at_time(t_sec, fps=fps)
+        pose_at = getattr(self.sg_backend, 'ego_pose_at_time_hugsim', None)
+        if self._use_exact_ego_pose and callable(pose_at):
+            ego_pose = np.asarray(pose_at(float(t_sec)), dtype=np.float64)
+            self._exact_ego_pose = ego_pose.copy()
+            pos = ego_pose[:3, 3]
+            fwd = ego_pose[:3, 2]
+            vab = np.array([pos[0], pos[2]], dtype=np.float64)
+            vr = np.array(
+                [0.0, math.atan2(float(fwd[0]), float(fwd[2])), 0.0],
+                dtype=np.float64,
+            )
+        else:
+            self._exact_ego_pose = None
+            vab, vr = self.sg_start_pose_at_time(t_sec, fps=fps)
         self.vab = np.array(vab, dtype=np.float64)
         self.vr = np.array(vr, dtype=np.float64)
         self.velo = float(self.sg_log_speed_at_time(t_sec, fps=fps))
@@ -625,19 +672,6 @@ class HUGSimEnv(gymnasium.Env):
             'cy': target_h / 2.0,
         }
 
-    def _pinhole_intrinsic_from_hfov(self, image_size, hfov_degrees):
-        target_w, target_h = int(image_size[0]), int(image_size[1])
-        hfov = math.radians(float(hfov_degrees))
-        focal = target_w / (2.0 * math.tan(hfov / 2.0))
-        return {
-            'H': target_h,
-            'W': target_w,
-            'fovx': hfov,
-            'fovy': _focal2fov(focal, target_h),
-            'cx': target_w / 2.0,
-            'cy': target_h / 2.0,
-        }
-
     def _requested_sg_native_camera_names(self, camera_cfg):
         camera_names = list(camera_cfg.get('camera_names', []))
         if not camera_names:
@@ -685,7 +719,6 @@ class HUGSimEnv(gymnasium.Env):
         assert front_cam is not None, 'SG native camera config requires CAM_FRONT'
         front_c2w = self._sg_cam_c2w_hugsim(front_cam)
         agent_sg_native = camera_cfg.get('agent_sg_native', {})
-        pai_hfov_deg = agent_sg_native.get('pai_rectified_hfov_deg', None)
         use_dataset_cam_to_vehicle = bool(agent_sg_native.get('use_dataset_cam_to_vehicle', False))
         legacy_render_gaia_rig = bool(agent_sg_native.get('render_gaia_rig', False))
         rig_mode = str(agent_sg_native.get('rig_mode', '')).strip().lower()
@@ -738,7 +771,6 @@ class HUGSimEnv(gymnasium.Env):
             front_pose_sv = None
 
         cam_params = {}
-        dataset_type = getattr(self.sg_backend, 'dataset_type', '')
         for cam_name in camera_names:
             if cam_name == 'CAM_BACK':
                 continue
@@ -768,8 +800,6 @@ class HUGSimEnv(gymnasium.Env):
                     )
                 cam_c2w = self._sg_cam_c2w_hugsim(cam)
                 intrinsic = self._intrinsic_from_sg_cam(cam, image_size)
-                if dataset_type == 'pai' and pai_hfov_deg is not None:
-                    intrinsic = self._pinhole_intrinsic_from_hfov(image_size, pai_hfov_deg)
             gaia_name = gaia_camera_map.get(cam_name)
             use_gaia_pinhole_intrinsic = (
                 uses_gaia_intrinsics
@@ -792,10 +822,21 @@ class HUGSimEnv(gymnasium.Env):
                 'l2c': v2c.copy(),
                 'sg_render': True,
             }
+            is_alpasim_scene = getattr(self.sg_backend, 'dataset_type', '') == 'alpasim'
             if use_dataset_cam_to_vehicle and cam is not None:
-                cam_params[cam_name]['agent_cam_to_vehicle'] = np.asarray(
-                    cam.extrinsic, dtype=np.float64
-                ).copy()
+                render_vehicle_to_camera = np.asarray(cam.extrinsic, dtype=np.float64).copy()
+                if is_alpasim_scene:
+                    cam_params[cam_name]['vehicle_to_camera'] = render_vehicle_to_camera.copy()
+                agent_cam_to_vehicle = render_vehicle_to_camera.copy()
+                if is_alpasim_scene:
+                    hugsim_to_navsim = np.eye(4, dtype=np.float64)
+                    hugsim_to_navsim[:3, :3] = np.array([
+                        [0.0, 0.0, 1.0],
+                        [-1.0, 0.0, 0.0],
+                        [0.0, -1.0, 0.0],
+                    ], dtype=np.float64)
+                    agent_cam_to_vehicle = hugsim_to_navsim @ agent_cam_to_vehicle
+                cam_params[cam_name]['agent_cam_to_vehicle'] = agent_cam_to_vehicle
 
         # Waymo perception SG scenes have no rear training camera. Keep a
         # black rear slot with a valid placeholder K/extrinsic so drivoR's
@@ -823,9 +864,25 @@ class HUGSimEnv(gymnasium.Env):
             vr[1]  = yaw, CW-positive from +z toward +x
         """
         assert self.sg_backend is not None, "sg_start_pose_at_time requires SG mode"
-        frame_idx = int(round(float(t_sec) * float(fps)))
+        pose_at = getattr(self.sg_backend, 'ego_pose_at_time_hugsim', None)
         sgb = self.sg_backend
+        is_alpasim_scene = getattr(sgb, 'dataset_type', '') == 'alpasim'
+        if (self._use_exact_ego_pose or is_alpasim_scene) and callable(pose_at):
+            ego_pose = np.asarray(pose_at(float(t_sec)), dtype=np.float64)
+            pos = ego_pose[:3, 3]
+            fwd = ego_pose[:3, 2]
+            return (
+                np.array([pos[0], pos[2]], dtype=np.float64),
+                np.array([0.0, math.atan2(float(fwd[0]), float(fwd[2])), 0.0],
+                         dtype=np.float64),
+            )
+        if is_alpasim_scene:
+            raise RuntimeError(
+                'AlpaSim scene requires ego_pose_at_time_hugsim to derive '
+                'the vehicle pose from the recorded rig trajectory'
+            )
         front_cam_id = sgb.cam_id_for_name('CAM_FRONT')
+        frame_idx = int(round(float(t_sec) * float(fps)))
         front_cam = None
         for cam in sgb.train_cams:
             if cam.meta.get('frame_idx', -1) == frame_idx and cam.meta.get('cam', -1) == front_cam_id:
@@ -866,6 +923,15 @@ class HUGSimEnv(gymnasium.Env):
     def sg_log_speed_at_time(self, t_sec, fps=10.0):
         """Estimate logged ego speed at ``t_sec`` from adjacent SG front poses."""
         assert self.sg_backend is not None, "sg_log_speed_at_time requires SG mode"
+        pose_at = getattr(self.sg_backend, 'ego_pose_at_time_hugsim', None)
+        if (self._use_exact_ego_pose or getattr(self.sg_backend, 'dataset_type', '') == 'alpasim') and callable(pose_at):
+            t = float(t_sec)
+            dt = 1.0 / float(fps)
+            t0 = max(0.0, t - dt)
+            t1 = t + dt
+            p0 = np.asarray(pose_at(t0), dtype=np.float64)[:3, 3]
+            p1 = np.asarray(pose_at(t1), dtype=np.float64)[:3, 3]
+            return float(np.linalg.norm(p1[[0, 2]] - p0[[0, 2]]) / max(t1 - t0, 1e-6))
         target_idx = int(round(float(t_sec) * float(fps)))
         sgb = self.sg_backend
         front_cam_id = sgb.cam_id_for_name('CAM_FRONT')
@@ -1035,8 +1101,12 @@ class HUGSimEnv(gymnasium.Env):
             v2c = params['v2c']
             if params.get('sg_render', True):
                 # NO cam_rect for SG — SG was trained on raw cam poses.
-                c2front_no_rect = v2front @ np.linalg.inv(v2c)
-                c2w = self.ego @ c2front_no_rect
+                vehicle_to_camera = params.get('vehicle_to_camera')
+                if vehicle_to_camera is not None:
+                    c2w = self.ego @ np.asarray(vehicle_to_camera, dtype=np.float64)
+                else:
+                    c2front_no_rect = v2front @ np.linalg.inv(v2c)
+                    c2w = self.ego @ c2front_no_rect
 
                 rgb = self.sg_backend.render(
                     c2w_hugsim=c2w,
@@ -1066,6 +1136,7 @@ class HUGSimEnv(gymnasium.Env):
         return {
             'ego_pos'  : wego_t.tolist(),
             'ego_rot'  : wego_r.tolist(),
+            'ego_pose_hugsim': np.asarray(self.ego, dtype=np.float64).tolist(),
             'ego_velo' : self.velo,
             'ego_steer': self.steer,
             'accelerate': self.last_accel,
@@ -1086,6 +1157,7 @@ class HUGSimEnv(gymnasium.Env):
         return super().close()
     
     def reset(self, seed=None, options=None):
+        self._exact_ego_pose = None
         self.vr = deepcopy(self.start_vr)
         self.vab = deepcopy(self.start_vab)
         self.velo = deepcopy(self.start_velo)

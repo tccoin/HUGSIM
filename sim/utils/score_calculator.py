@@ -1,17 +1,14 @@
 import pickle
 from matplotlib import pyplot as plt
-from matplotlib.patches import Rectangle, Polygon
+from matplotlib.patches import Polygon
 from shapely.geometry import LineString, Point
 import numpy as np
 from shapely.geometry import Polygon as ShapelyPolygon
-from shapely.geometry import Point
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-import threading
 import argparse
 import os
 import open3d as o3d
 import torch
+from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as SCR
 
 ego_verts_canonic = np.array([[0.5, 0.5, 0], [0.5, -0.5, 0], [0.5, 0.5, 1.0], [0.5, -0.5, 1.0],
@@ -32,6 +29,10 @@ score_weight = {
     'c': 2,
     'ep': 5,
 }
+
+DAC_GROUND_NEAR_M = 1.25
+DAC_FULL_SUPPORT_RATIO = 0.6
+COLLISION_AREA_EPS = 1e-3
 
 def create_rectangle(center_x, center_y, width, length, yaw):
     """Create a rectangle polygon."""
@@ -89,26 +90,14 @@ def calculate_trajectory_kinematics(traj, timestep):
     accel = np.diff(speed) / timestep
     jerk = np.diff(accel) / timestep
 
-    # Calculate yaw rate (already calculated as dyaw)
-    yaw_rate = dyaw
-    # Calculate yaw acceleration
-    yaw_accel = ddyaw
-
     lon_accel = accel
-    lat_accel = np.zeros_like(lon_accel)
+    lat_accel = speed * dyaw
     lon_jerk = jerk
-
-    # Pad arrays to match the original trajectory length
-    yaw_rate = np.pad(yaw_rate, (0, 1), 'edge')
-    yaw_accel = np.pad(yaw_accel, (0, 2), 'edge')
-    lon_accel = np.pad(lon_accel, (0, 2), 'edge')
-    lat_accel = np.pad(lat_accel, (0, 2), 'edge')
-    lon_jerk = np.pad(lon_jerk, (0, 3), 'edge')
 
     return {
         'speed': speed,
-        'yaw_rate': yaw_rate,
-        'yaw_accel': yaw_accel,
+        'yaw_rate': dyaw,
+        'yaw_accel': ddyaw,
         'lon_accel': lon_accel,
         'lat_accel': lat_accel,
         'lon_jerk': lon_jerk,
@@ -118,6 +107,8 @@ def calculate_trajectory_kinematics(traj, timestep):
 class ScoreCalculator:
     def __init__(self, data):
         self.data = data
+        self._ground_tree = None
+        self._ground_tree_key = None
 
         self.pdms = 0.0
         self.driving_score = None
@@ -188,9 +179,6 @@ class ScoreCalculator:
         plt.figure(figsize=(10, 10))
         plt.imshow(drivable_mask, cmap='gray', extent=[-50, 50, -50, 50])
 
-        # Scale factor (200 pixels represent 100 meters)
-        scale_factor = 200 / 100  # pixels per meter
-
         # Plot trajectory
         x_coords, y_coords, yaws = transformed_traj.T
         plt.plot(x_coords, y_coords, 'r-', linewidth=2)
@@ -213,55 +201,43 @@ class ScoreCalculator:
         plt.tight_layout()
         plt.show()
     
+    def _get_ground_tree(self, ground):
+        if ground is None or len(ground) == 0:
+            return None
+        ground_array = np.asarray(ground, dtype=np.float64)
+        ground_key = (id(ground), ground_array.shape)
+        if self._ground_tree is None or self._ground_tree_key != ground_key:
+            self._ground_tree = cKDTree(ground_array)
+            self._ground_tree_key = ground_key
+        return self._ground_tree
+
+    def _drivable_support_score(self, ground, x, y, yaw, vehicle_width, vehicle_length):
+        tree = self._get_ground_tree(ground)
+        if tree is None:
+            return 1.0
+
+        xs = np.linspace(-vehicle_length / 2, vehicle_length / 2, 5)
+        ys = np.linspace(-vehicle_width / 2, vehicle_width / 2, 3)
+        local_samples = np.array([(sx, sy) for sx in xs for sy in ys], dtype=np.float64)
+        c, s = np.cos(yaw), np.sin(yaw)
+        R = np.array([[c, -s], [s, c]], dtype=np.float64)
+        samples = (R @ local_samples.T).T + np.array([x, y], dtype=np.float64)
+        distances, _ = tree.query(samples, k=1)
+        support_ratio = float(np.mean(distances <= DAC_GROUND_NEAR_M))
+        return min(1.0, support_ratio / DAC_FULL_SUPPORT_RATIO)
+
     def _calculate_drivable_area_compliance(self, ground, traj, vehicle_width, vehicle_length):
-        m, n = 2, 2
-        dac = 1.0
-        for traj_i, (x, y, yaw) in enumerate(traj):
-            cnt = 0
-            c, s = np.cos(yaw), np.sin(yaw)
-            R = np.array([[c, -s], [s, c]])
-            ground_in_ego = (np.linalg.inv(R) @ (ground + np.array([-x, -y])).T).T
-            x_bins = np.linspace(-vehicle_length/2, vehicle_length/2, m+1)
-            y_bins = np.linspace(-vehicle_width/2, vehicle_width/2, n+1)
-            for xi in range(m):
-                for yi in range(n):
-                    min_x, max_x = x_bins[xi], x_bins[xi+1]
-                    min_y, max_y = y_bins[yi], y_bins[yi+1]
-                    ground_mask = (min_x < ground_in_ego[:, 0]) & (ground_in_ego[:, 0] < max_x) & \
-                                    (min_y < ground_in_ego[:, 1]) & (ground_in_ego[:, 1] < max_y)
-                    if ground_mask.sum() > 0:
-                        cnt += 1
-            drivable_ratio = cnt / (m*n)
-            if drivable_ratio < 0.3:
-                return 0.0
-            elif drivable_ratio < 0.5:
-                dac = 0.5
-        return dac
+        if len(traj) == 0:
+            return 1.0
+        pose_scores = [
+            self._drivable_support_score(ground, x, y, yaw, vehicle_width, vehicle_length)
+            for x, y, yaw in traj
+        ]
+        return float(np.mean(pose_scores))
     
     def _single_frame_drivable_area_compliance(self, ground, ego, vehicle_width, vehicle_length):
-        m, n = 2, 2
-        dac = 1.0
         x, y, _, _, _, _, yaw = ego
-        cnt = 0
-        c, s = np.cos(yaw), np.sin(yaw)
-        R = np.array([[c, -s], [s, c]])
-        ground_in_ego = (np.linalg.inv(R) @ (ground + np.array([-x, -y])).T).T
-        x_bins = np.linspace(-vehicle_length/2, vehicle_length/2, m+1)
-        y_bins = np.linspace(-vehicle_width/2, vehicle_width/2, n+1)
-        for xi in range(m):
-            for yi in range(n):
-                min_x, max_x = x_bins[xi], x_bins[xi+1]
-                min_y, max_y = y_bins[yi], y_bins[yi+1]
-                ground_mask = (min_x < ground_in_ego[:, 0]) & (ground_in_ego[:, 0] < max_x) & \
-                                (min_y < ground_in_ego[:, 1]) & (ground_in_ego[:, 1] < max_y)
-                if ground_mask.sum() > 0:
-                    cnt += 1
-        drivable_ratio = cnt / (m*n)
-        if drivable_ratio < 0.3:
-            return 0.0
-        elif drivable_ratio < 0.5:
-            dac = 0.5
-        return dac
+        return self._drivable_support_score(ground, x, y, yaw, vehicle_width, vehicle_length)
 
     def _calculate_progress(self, planned_traj, ref_taj):
         def calculate_curve_length(points):
@@ -311,7 +287,48 @@ class ScoreCalculator:
 
         kinematics = calculate_trajectory_kinematics(traj, timestep)
 
-        # Check each parameter against its boundary
+        def pass_rate(values, mask):
+            if len(values) == 0:
+                return 1.0
+            return float(np.mean(mask))
+
+        rates = [
+            pass_rate(
+                kinematics['lat_accel'],
+                np.abs(kinematics['lat_accel']) <= boundaries['max_abs_lat_accel'],
+            ),
+            pass_rate(
+                kinematics['lon_accel'],
+                (kinematics['lon_accel'] <= boundaries['max_lon_accel'])
+                & (kinematics['lon_accel'] >= boundaries['min_lon_accel']),
+            ),
+            pass_rate(
+                kinematics['lon_jerk'],
+                np.abs(kinematics['lon_jerk']) <= boundaries['max_abs_lon_jerk'],
+            ),
+            pass_rate(
+                kinematics['yaw_accel'],
+                np.abs(kinematics['yaw_accel']) <= boundaries['max_abs_yaw_accel'],
+            ),
+            pass_rate(
+                kinematics['yaw_rate'],
+                np.abs(kinematics['yaw_rate']) <= boundaries['max_abs_yaw_rate'],
+            ),
+        ]
+
+        return float(min(rates))
+    
+    def _calculate_actual_comfort(self, traj, timestep):
+        """
+        Check if all kinematic parameters of a trajectory are within specified boundaries.
+
+        :param traj: List of tuples (x, y, yaw) representing the trajectory, in ego's local frame
+        :param timestep: Time interval between trajectory points in seconds
+        :return: 1.0 if all parameters are within boundaries, 0.0 otherwise
+        """
+
+        kinematics = calculate_trajectory_kinematics(traj, timestep)
+
         checks = [
             np.all(np.abs(kinematics['lat_accel']) <=
                    boundaries['max_abs_lat_accel']),
@@ -325,82 +342,30 @@ class ScoreCalculator:
                    boundaries['max_abs_yaw_rate'])
         ]
 
-        # if not all(checks):
-        #     print(traj)
-        #     print(kinematics)
-        print(f"comfortable: {checks}")
+        return np.array(checks, dtype=bool)
 
-        # Return 1.0 if all checks pass, 0.0 otherwise
-        return 1.0 if all(checks) else 0.0
-    
-    def _calculate_actual_comfort(self, traj, timestep):
-        """
-        Check if all kinematic parameters of a trajectory are within specified boundaries.
-
-        :param traj: List of tuples (x, y, yaw) representing the trajectory, in ego's local frame
-        :param timestep: Time interval between trajectory points in seconds
-        :return: 1.0 if all parameters are within boundaries, 0.0 otherwise
-        """
-
-        kinematics = calculate_trajectory_kinematics(traj, timestep)
-
-        # Check each parameter against its boundary
-        checks = [
-            np.all(np.abs(kinematics['lat_accel']) <=
-                   boundaries['max_abs_lat_accel']),
-            np.all(kinematics['lon_accel'] <= boundaries['max_abs_lat_accel']),
-            np.all(kinematics['lon_accel'] >= boundaries['min_lon_accel']),
-            np.all(np.abs(kinematics['lon_jerk']) <=
-                   boundaries['max_abs_lon_jerk']),
-            np.all(np.abs(kinematics['yaw_accel']) <=
-                   boundaries['max_abs_yaw_accel']),
-            np.all(np.abs(kinematics['yaw_rate']) <=
-                   boundaries['max_abs_yaw_rate'])
-        ]
-        
-        lat_accel_check = np.abs(kinematics['lat_accel']) <= boundaries['max_abs_lat_accel']
-        lon_accel_check = (kinematics['lon_accel'] >= boundaries['min_lon_accel']) & (kinematics['lon_accel'] <= boundaries['max_lon_accel'])
-        lon_jerk_check = np.abs(kinematics['lon_jerk']) <= boundaries['max_abs_lon_jerk']
-        yaw_accel_check = np.abs(kinematics['yaw_accel']) <= boundaries['max_abs_yaw_accel']
-        yaw_rate_check = np.abs(kinematics['yaw_rate']) <= boundaries['max_abs_yaw_rate']
-        checks = lat_accel_check & lon_accel_check & lon_jerk_check & yaw_accel_check & yaw_rate_check
-
-        print(f"comfortable: {checks}")
-
-        # Return 1.0 if all checks pass, 0.0 otherwise
-        return checks
-
-    def _calculate_no_collision(self, ego_box, planned_traj, obs_lists, scene_xyz):
+    def _calculate_no_collision(self, ego_box, planned_traj, obs_lists, scene_xyz, check_background=True):
         ego_x, ego_y, z, ego_w, ego_l, ego_h, ego_yaw = ego_box
         ego_verts_local = ego_verts_canonic * np.array([ego_l, ego_w, ego_h])
         for idx in range(planned_traj.shape[0]):
             ego_x, ego_y, ego_yaw = planned_traj[idx]  # ego_state= (x,y,yaw)
-            ego_trans_mat = np.eye(4)
-            ego_trans_mat[:3, :3] = SCR.from_euler('z', ego_yaw).as_matrix()
-            ego_trans_mat[:3, 3] = np.array([ego_x, ego_y, z])
-            ego_verts_global = (ego_trans_mat[:3, :3] @ ego_verts_local.T).T + ego_trans_mat[:3, 3]
-            ego_verts_global = torch.from_numpy(ego_verts_global).float().cuda()
-            bk_collision = bg_collision_det(scene_xyz, ego_verts_global)
-            # scene_local = scene_xyz - np.array([ego_x, ego_y, z])
-            # bk_collision = np.sum(
-            #     (-ego_l/2 < scene_local[:, 0]) & (scene_local[:, 0] < ego_l/2) & \
-            #     (-ego_w/2 < scene_local[:, 1]) & (scene_local[:, 1] < ego_w/2) & \
-            #     (-ego_h/2 < scene_local[:, 2]) & (scene_local[:, 2] < ego_h/2)
-            # ) > 100
-            if bk_collision:
-                print(f"collision with background detected! @ timestep{idx}")
-                return 0.0
+            if check_background:
+                ego_trans_mat = np.eye(4)
+                ego_trans_mat[:3, :3] = SCR.from_euler('z', ego_yaw).as_matrix()
+                ego_trans_mat[:3, 3] = np.array([ego_x, ego_y, z])
+                ego_verts_global = (ego_trans_mat[:3, :3] @ ego_verts_local.T).T + ego_trans_mat[:3, 3]
+                ego_verts_global = torch.from_numpy(ego_verts_global).float().cuda()
+                bk_collision = bg_collision_det(scene_xyz, ego_verts_global)
+                if bk_collision:
+                    return 0.0
             ego_poly = create_rectangle(ego_x, ego_y, ego_w, ego_l, ego_yaw)
-            obs_list = obs_lists[idx if idx < len(obs_lists) else -1]
+            obs_list = [] if not obs_lists else obs_lists[idx if idx < len(obs_lists) else -1]
             for obs in obs_list:
                 # obs = (x,y,z,w,l,h,yaw)
                 obs_x, obs_y, _, obs_w, obs_l, _, obs_yaw = obs
                 obs_poly = create_rectangle(
                     obs_x, obs_y, obs_w, obs_l, obs_yaw)
-                if ego_poly.intersects(obs_poly):
-                    print(f"collision with obstacle detected! @ timestep{idx}")
-                    print(
-                        f"ego_poly: {(ego_x, ego_y, ego_yaw,obs_w, obs_l)}, obs_poly: {(obs_x, obs_y, obs_yaw,obs_w, obs_l )}")
+                if ego_poly.intersection(obs_poly).area > COLLISION_AREA_EPS:
                     return 0.0  # Collision detected
         return 1.0
 
@@ -448,10 +413,8 @@ class ScoreCalculator:
             new_traj[:, :2] += displacement
 
             is_collide_score = self._calculate_no_collision(
-                ego_box, new_traj, obs_lists, scene_xyz)
+                ego_box, new_traj, obs_lists, scene_xyz, check_background=False)
             if is_collide_score == 0.0:
-                print(f" failed to pass ttc collision check, t={t}")
-                # breakpoint()
                 return 0.0
 
         return 1.0
@@ -460,7 +423,8 @@ class ScoreCalculator:
 
         print(f"current exp has {len(self.data['frames'])} frames")
         if len(self.data['frames']) == 0:
-            return None
+            averages = {'nc': 0.0, 'dac': 0.0, 'ttc': 0.0, 'c': 0.0, 'pdms': 0.0}
+            return 0.0, 0.0, 0.0, averages, {}
 
         score_list = {}
         
@@ -547,6 +511,12 @@ class ScoreCalculator:
             score_list[timestamp] = {'nc': score_nc, 'dac': score_dac,
                                      'ttc': score_ttc, 'c': score_c, 'pdms': score_pdms}
         
+        if not score_list:
+            route_completion = max([f.get('rc', 0.0) for f in self.data['frames']], default=0.0)
+            route_completion = route_completion if route_completion < 1 else 1.0
+            averages = {'nc': 0.0, 'dac': 0.0, 'ttc': 0.0, 'c': 0.0, 'pdms': 0.0}
+            return 0.0, route_completion, 0.0, averages, score_list
+
         totals = {metric: 0 for metric in next(iter(score_list.values()))}
         for scores in score_list.values():
             for metric, value in scores.items():
