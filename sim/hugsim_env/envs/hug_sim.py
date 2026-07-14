@@ -3,7 +3,6 @@ import numpy as np
 from copy import deepcopy
 import gymnasium
 from gymnasium import spaces
-from copy import deepcopy
 from sim.utils.sim_utils import create_cam, rt2pose, pose2rt, load_camera_cfg, dense_cam_poses
 from scipy.spatial.transform import Rotation as SCR
 from sim.utils.score_calculator import create_rectangle, bg_collision_det
@@ -126,6 +125,10 @@ class HUGSimEnv(gymnasium.Env):
             bool(sg_cfg.get('use_controller_absolute_pose', True))
             if self.sg_enabled else True
         )
+        self._ground_pose_correction = (
+            str(sg_cfg.get('ground_pose_correction', 'none')).lower()
+            if self.sg_enabled else 'none'
+        )
         self._exact_ego_pose = None
 
         if not self.sg_enabled:
@@ -176,6 +179,8 @@ class HUGSimEnv(gymnasium.Env):
                         sg_cfg.get('ego_mask_rig_config_id', 'hyperion_8')),
                     render_intrinsics=str(sg_cfg.get('render_intrinsics', 'native')),
                     time_origin_offset_s=float(sg_cfg.get('time_origin_offset_s', 0.0)),
+                    physics_address=str(sg_cfg.get('physics_address', '')),
+                    height_correction=str(sg_cfg.get('height_correction', 'recorded')),
                     timeout_s=float(sg_cfg.get('timeout_s', 60.0)),
                 )
             else:
@@ -335,6 +340,76 @@ class HUGSimEnv(gymnasium.Env):
         uhv_world = nearest_c2w[:3, :3] @ uhv_local + nearest_c2w[:3, 3]
         
         return uhv_world[1]
+
+    @staticmethod
+    def _fit_plane(points):
+        points = np.asarray(points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[0] < 3:
+            return None
+        ctr = points.mean(axis=0)
+        _, _, vh = np.linalg.svd(points - ctr, full_matrices=False)
+        normal = vh[-1]
+        norm = np.linalg.norm(normal)
+        if norm < 1e-9:
+            return None
+        return ctr, normal / norm
+
+    def _apply_local_ground_pose_correction(self, pose):
+        if self._ground_pose_correction != 'local_plane':
+            return pose
+        if self.ground_model is None or not hasattr(self, 'whl'):
+            return pose
+
+        width, _, length = [float(x) for x in self.whl]
+        grid = np.linspace(0.0, 1.0, 4)
+        xs, zs = np.meshgrid(grid, grid)
+        bottom_local = np.column_stack([
+            xs.ravel() * width - width * 0.5,
+            np.zeros(xs.size, dtype=np.float64),
+            zs.ravel() * length - length * 0.5,
+            np.ones(xs.size, dtype=np.float64),
+        ])
+        bottom_world = (np.asarray(pose, dtype=np.float64) @ bottom_local.T).T[:, :3]
+        ground_world = bottom_world.copy()
+        for i, point in enumerate(bottom_world):
+            ground_world[i, 1] = self.ground_height(float(point[0]), float(point[2]))
+
+        bottom_plane = self._fit_plane(bottom_world)
+        ground_plane = self._fit_plane(ground_world)
+        if bottom_plane is None or ground_plane is None:
+            return pose
+        bottom_ctr, bottom_normal = bottom_plane
+        ground_ctr, ground_normal = ground_plane
+        if float(np.dot(bottom_normal, ground_normal)) < 0.0:
+            bottom_normal = -bottom_normal
+
+        displacement = ground_ctr - bottom_ctr
+        if np.linalg.norm(displacement) > 1.5:
+            return pose
+        try:
+            rot = SCR.align_vectors(
+                ground_normal.reshape(1, 3),
+                bottom_normal.reshape(1, 3),
+            )[0]
+            rot_mat = rot.as_matrix()
+        except Exception:
+            return pose
+        if np.abs(rot.as_euler('xyz', degrees=True)).max() > 10.0:
+            return pose
+
+        updated = np.asarray(pose, dtype=np.float64).copy()
+        t = np.eye(4, dtype=np.float64)
+        t[:3, 3] = updated[:3, 3]
+        inv_t = np.eye(4, dtype=np.float64)
+        inv_t[:3, 3] = -updated[:3, 3]
+        local_rot = np.eye(4, dtype=np.float64)
+        local_rot[:3, :3] = rot_mat
+        trans = np.eye(4, dtype=np.float64)
+        trans[:3, 3] = displacement
+        corrected = trans @ t @ local_rot @ inv_t @ updated
+        corrected[0, 3] = updated[0, 3]
+        corrected[2, 3] = updated[2, 3]
+        return corrected
     
     @property
     def route_completion(self):
@@ -357,7 +432,7 @@ class HUGSimEnv(gymnasium.Env):
     def ego(self):
         if self._use_exact_ego_pose and self._exact_ego_pose is not None:
             return np.asarray(self._exact_ego_pose, dtype=np.float64)
-        return rt2pose(self.vr, self.vt)
+        return self._apply_local_ground_pose_correction(rt2pose(self.vr, self.vt))
     
     @property
     def ego_state(self):
@@ -365,6 +440,12 @@ class HUGSimEnv(gymnasium.Env):
     
     @property
     def ego_box(self):
+        if self._use_exact_ego_pose and self._exact_ego_pose is not None:
+            ego_pose = np.asarray(self._exact_ego_pose, dtype=np.float64)
+            pos = ego_pose[:3, 3]
+            fwd = ego_pose[:3, 2]
+            yaw = np.arctan2(float(fwd[0]), float(fwd[2]))
+            return [pos[2], -pos[0], -pos[1], self.whl[0], self.whl[2], self.whl[1], -yaw]
         return [self.vt[2], -self.vt[0], -self.vt[1], self.whl[0], self.whl[2], self.whl[1], -self.vr[1]]
 
     @property
@@ -822,6 +903,11 @@ class HUGSimEnv(gymnasium.Env):
                 'l2c': v2c.copy(),
                 'sg_render': True,
             }
+            if use_gaia_rig and gaia_name is not None:
+                cam_params[cam_name]['pose_SV'] = gaia_pose_sv[gaia_name].copy()
+            if use_gaia_pinhole_intrinsic:
+                cam_params[cam_name]['camera_model'] = 'PINHOLE'
+                cam_params[cam_name]['distortion'] = np.zeros(0, dtype=np.float32)
             is_alpasim_scene = getattr(self.sg_backend, 'dataset_type', '') == 'alpasim'
             if use_dataset_cam_to_vehicle and cam is not None:
                 render_vehicle_to_camera = np.asarray(cam.extrinsic, dtype=np.float64).copy()
@@ -1130,7 +1216,8 @@ class HUGSimEnv(gymnasium.Env):
     def _get_info(self):
         wego_r, wego_t = pose2rt(self.ego)
         cam_poses, _, commands = self.ground_model
-        dist = np.sum((cam_poses[:, :3, 3] - self.vt) ** 2, axis=-1)
+        ego_pos = np.asarray(self.ego, dtype=np.float64)[:3, 3]
+        dist = np.sum((cam_poses[:, :3, 3] - ego_pos) ** 2, axis=-1)
         nearest_cam_idx = np.argmin(dist)
         command = commands[nearest_cam_idx]
         return {

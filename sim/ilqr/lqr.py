@@ -1,5 +1,25 @@
-from sim.ilqr.lqr_solver import ILQRSolverParameters, ILQRWarmStartParameters, ILQRSolver
+import os
+
 import numpy as np
+
+from sim.ilqr.lqr_solver import ILQRSolver, ILQRSolverParameters, ILQRWarmStartParameters
+
+
+def _max_solve_time_from_env():
+    raw = os.environ.get("HUGSIM_ILQR_MAX_SOLVE_TIME_S", "0.05").strip().lower()
+    if raw in {"", "none", "off", "disabled"}:
+        return None
+    value = float(raw)
+    if value <= 0.0:
+        raise ValueError("HUGSIM_ILQR_MAX_SOLVE_TIME_S must be positive or 'none'")
+    return value
+
+
+def _max_iterations_from_env():
+    value = int(os.environ.get("HUGSIM_ILQR_MAX_ITERATIONS", "100"))
+    if value <= 0:
+        raise ValueError("HUGSIM_ILQR_MAX_ITERATIONS must be positive")
+    return value
 
 solver_params = ILQRSolverParameters(
     discretization_time=0.5,
@@ -7,9 +27,9 @@ solver_params = ILQRSolverParameters(
     input_cost_diagonal_entries=[1.0, 10.0],
     state_trust_region_entries=[1.0] * 5,
     input_trust_region_entries=[1.0] * 2,
-    max_ilqr_iterations=100,
+    max_ilqr_iterations=_max_iterations_from_env(),
     convergence_threshold=1e-6,
-    max_solve_time=0.05,
+    max_solve_time=_max_solve_time_from_env(),
     max_acceleration=3.0,
     max_steering_angle=np.pi / 3.0,
     max_steering_angle_rate=0.4,
