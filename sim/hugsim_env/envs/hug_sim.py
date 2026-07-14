@@ -17,45 +17,22 @@ from scene.obj_model import ObjModel
 from gaussian_renderer import render
 import open3d as o3d
 
+from gs_world.planning_agents.gaia_e2e.camera_geometry import (
+    FLU_TO_RDF,
+    pose_sv_to_hugsim_cam_to_vehicle,
+)
+from gs_world.utils.rotation import quaternion_wxyz_to_matrix, rotvec_to_matrix
+
 
 def _focal2fov(focal, pixels):
     return 2.0 * math.atan(float(pixels) / (2.0 * float(focal)))
 
 
-FLU_TO_RDF = np.array(
-    [[0, -1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0], [0, 0, 0, 1]],
-    dtype=np.float64,
-)
-
-
-def _quat_wxyz_to_mat(q):
-    w = float(q["w"])
-    x = float(q["x"])
-    y = float(q["y"])
-    z = float(q["z"])
-    n = math.sqrt(w * w + x * x + y * y + z * z)
-    if n == 0.0:
-        return np.eye(3, dtype=np.float64)
-    w, x, y, z = w / n, x / n, y / n, z / n
-    return np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
-
-
-def _rotvec_to_mat(wx, wy, wz):
-    vec = np.array([wx, wy, wz], dtype=np.float64)
-    theta = float(np.linalg.norm(vec))
-    if theta < 1e-10:
-        return np.eye(3, dtype=np.float64)
-    axis = vec / theta
-    x, y, z = axis
-    skew = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=np.float64)
-    return np.eye(3, dtype=np.float64) + math.sin(theta) * skew + (1.0 - math.cos(theta)) * (skew @ skew)
+def _validate_sg_native_rig_config(use_gaia_rig, use_dataset_cam_to_vehicle):
+    if use_gaia_rig and use_dataset_cam_to_vehicle:
+        raise ValueError(
+            'rig_mode=gaia cannot use dataset cam-to-vehicle extrinsics'
+        )
 
 
 def _load_gaia_pose_sv(camera_info_dir, camera_name):
@@ -63,8 +40,13 @@ def _load_gaia_pose_sv(camera_info_dir, camera_name):
     with open(path, "r") as f:
         data = json.load(f)
     ext = data["calibration"]["extrinsics"]["transform_VS"]
-    rot = _quat_wxyz_to_mat(ext["so3"])
-    rot = rot @ _rotvec_to_mat(0.0, 0.0, math.pi / 2.0) @ _rotvec_to_mat(0.0, -math.pi / 2.0, 0.0)
+    quaternion = ext["so3"]
+    rot = quaternion_wxyz_to_matrix(
+        [quaternion["w"], quaternion["x"], quaternion["y"], quaternion["z"]]
+    )
+    rot = rot @ rotvec_to_matrix([0.0, 0.0, math.pi / 2.0]) @ rotvec_to_matrix(
+        [0.0, -math.pi / 2.0, 0.0]
+    )
     pose_vs = np.eye(4, dtype=np.float64)
     pose_vs[:3, :3] = rot
     pose_vs[:3, 3] = np.asarray(ext["translation"]["matrix"][0], dtype=np.float64)
@@ -808,6 +790,7 @@ class HUGSimEnv(gymnasium.Env):
         if rig_mode not in ('hugsim', 'gaia'):
             raise ValueError("agent_sg_native.rig_mode must be 'hugsim' or 'gaia'")
         use_gaia_rig = rig_mode == 'gaia'
+        _validate_sg_native_rig_config(use_gaia_rig, use_dataset_cam_to_vehicle)
         intrinsics_mode = str(agent_sg_native.get('intrinsics_mode', '')).strip().lower()
         if intrinsics_mode not in ('', 'hugsim', 'gaia'):
             raise ValueError("agent_sg_native.intrinsics_mode must be 'hugsim' or 'gaia'")
@@ -904,7 +887,12 @@ class HUGSimEnv(gymnasium.Env):
                 'sg_render': True,
             }
             if use_gaia_rig and gaia_name is not None:
-                cam_params[cam_name]['pose_SV'] = gaia_pose_sv[gaia_name].copy()
+                pose_sv = gaia_pose_sv[gaia_name].copy()
+                cam_params[cam_name]['pose_SV'] = pose_sv
+                cam_params[cam_name]['vehicle_to_camera'] = (
+                    pose_sv_to_hugsim_cam_to_vehicle(pose_sv)
+                )
+                cam_params[cam_name]['agent_cam_to_vehicle'] = np.linalg.inv(pose_sv)
             if use_gaia_pinhole_intrinsic:
                 cam_params[cam_name]['camera_model'] = 'PINHOLE'
                 cam_params[cam_name]['distortion'] = np.zeros(0, dtype=np.float32)
