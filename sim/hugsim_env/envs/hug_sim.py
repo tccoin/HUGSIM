@@ -400,7 +400,8 @@ class HUGSimEnv(gymnasium.Env):
             (cam_poses[:, 0, 3] - self.vab[0])**2 + (cam_poses[:, 2, 3] - self.vab[1])**2
         )
         nearest_cam_idx = np.argmin(cam_dist, axis=0)
-        return (nearest_cam_idx + 1) / (cam_poses.shape[0] * 0.9), cam_dist[nearest_cam_idx]
+        completion = (nearest_cam_idx + 1) / max(float(cam_poses.shape[0]), 1.0)
+        return float(np.clip(completion, 0.0, 1.0)), cam_dist[nearest_cam_idx]
         
 
     @property
@@ -1108,9 +1109,15 @@ class HUGSimEnv(gymnasium.Env):
             off_route = True
             print('Far from preset trajectory')
 
-        # No route_complete termination: rc is still reported in info for
-        # eval, but reaching rc>=1 no longer ends the sim. Termination only
-        # fires on collision or off-route from the log trajectory.
+        route_complete = bool(rc >= 1.0 - 1e-6)
+        if route_complete:
+            terminated = True
+            print('Route complete (kinematic_only)')
+        try:
+            _, max_log_time = self.sg_log_time_bounds()
+            log_complete = bool(float(self.timestamp) >= float(max_log_time) - 1e-6)
+        except Exception:
+            log_complete = False
 
         observation = self._get_obs()
         info = self._get_info()
@@ -1119,7 +1126,9 @@ class HUGSimEnv(gymnasium.Env):
         info['bg_collision'] = bool(bg_collision)
         info['fg_collision'] = bool(fg_collision)
         info['off_route']    = off_route
-        info['route_complete'] = False
+        info['route_complete'] = bool(route_complete)
+        info['log_complete'] = bool(log_complete)
+        terminated = bool(terminated or log_complete)
         info['kinematic_only'] = True
         return observation, reward, terminated, False, info
 
@@ -1290,8 +1299,15 @@ class HUGSimEnv(gymnasium.Env):
             print('Far from preset trajectory')
             reward = -50
 
-        # No route_complete termination: rc is still reported for eval but
-        # reaching rc>=1 no longer ends the sim.
+        route_complete = bool(rc >= 1.0 - 1e-6)
+        if route_complete:
+            terminated = True
+            print('Route complete')
+        try:
+            _, max_log_time = self.sg_log_time_bounds()
+            log_complete = bool(float(self.timestamp) >= float(max_log_time) - 1e-6)
+        except Exception:
+            log_complete = False
 
         observation = self._get_obs()
         info = self._get_info()
@@ -1300,6 +1316,8 @@ class HUGSimEnv(gymnasium.Env):
         info['bg_collision'] = bool(bg_collision)
         info['fg_collision'] = bool(fg_collision)
         info['off_route']    = off_route
-        info['route_complete'] = False
+        info['route_complete'] = bool(route_complete)
+        info['log_complete'] = bool(log_complete)
+        terminated = bool(terminated or log_complete)
 
         return observation, reward, terminated, False, info
