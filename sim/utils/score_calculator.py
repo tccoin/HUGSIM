@@ -33,6 +33,7 @@ score_weight = {
 DAC_GROUND_NEAR_M = 1.25
 DAC_FULL_SUPPORT_RATIO = 0.6
 COLLISION_AREA_EPS = 1e-3
+BG_COLLISION_POINT_THRESHOLD = 100
 
 def create_rectangle(center_x, center_y, width, length, yaw):
     """Create a rectangle polygon."""
@@ -49,7 +50,7 @@ def create_rectangle(center_x, center_y, width, length, yaw):
 
     return ShapelyPolygon(zip(x_pts, y_pts))
 
-def bg_collision_det(points, box):
+def bg_collision_point_count(points, box):
     O, A, B, C = box[0], box[1], box[2], box[5]
     OA = A - O
     OB = B - O
@@ -58,7 +59,16 @@ def bg_collision_det(points, box):
     mask = (torch.dot(O, OA) < POA) & (POA < torch.dot(A, OA)) & \
         (torch.dot(O, OB) < POB) & (POB < torch.dot(B, OB)) & \
         (torch.dot(O, OC) < POC) & (POC < torch.dot(C, OC))
-    return True if torch.sum(mask) > 100 else False
+    return int(torch.sum(mask).item())
+
+
+def bg_collision_det(points, box, threshold=BG_COLLISION_POINT_THRESHOLD):
+    """Return whether enough high-confidence scene points occupy the ego OBB.
+
+    The raw count is exposed separately so downstream metrics can audit and
+    recalibrate the threshold without having to rerun rendering.
+    """
+    return bg_collision_point_count(points, box) > int(threshold)
 
 def calculate_trajectory_kinematics(traj, timestep):
     """

@@ -5,7 +5,11 @@ import gymnasium
 from gymnasium import spaces
 from sim.utils.sim_utils import create_cam, rt2pose, pose2rt, load_camera_cfg, dense_cam_poses
 from scipy.spatial.transform import Rotation as SCR
-from sim.utils.score_calculator import create_rectangle, bg_collision_det
+from sim.utils.score_calculator import (
+    BG_COLLISION_POINT_THRESHOLD,
+    bg_collision_point_count,
+    create_rectangle,
+)
 import os
 import pickle
 import json
@@ -1092,7 +1096,8 @@ class HUGSimEnv(gymnasium.Env):
         reward = 0
         verts = (self.ego[:3, :3] @ self.ego_verts.T).T + self.ego[:3, 3]
         verts = torch.from_numpy(verts.astype(np.float32)).cuda()
-        bg_collision = bg_collision_det(self.points, verts)
+        bg_collision_points = bg_collision_point_count(self.points, verts)
+        bg_collision = bg_collision_points > BG_COLLISION_POINT_THRESHOLD
         if bg_collision:
             terminated = True
             print('Collision with background (kinematic_only)')
@@ -1124,6 +1129,8 @@ class HUGSimEnv(gymnasium.Env):
         info['rc'] = rc
         info['collision']    = bg_collision or fg_collision
         info['bg_collision'] = bool(bg_collision)
+        info['bg_collision_point_count'] = int(bg_collision_points)
+        info['bg_collision_point_threshold'] = int(BG_COLLISION_POINT_THRESHOLD)
         info['fg_collision'] = bool(fg_collision)
         info['off_route']    = off_route
         info['route_complete'] = bool(route_complete)
@@ -1278,7 +1285,8 @@ class HUGSimEnv(gymnasium.Env):
         verts = (self.ego[:3, :3] @ self.ego_verts.T).T + self.ego[:3, 3]
         verts = torch.from_numpy(verts.astype(np.float32)).cuda()
         
-        bg_collision = bg_collision_det(self.points, verts)
+        bg_collision_points = bg_collision_point_count(self.points, verts)
+        bg_collision = bg_collision_points > BG_COLLISION_POINT_THRESHOLD
         if bg_collision:
             terminated = True
             print('Collision with background')
@@ -1314,6 +1322,8 @@ class HUGSimEnv(gymnasium.Env):
         info['rc'] = rc
         info['collision']    = bg_collision or fg_collision
         info['bg_collision'] = bool(bg_collision)
+        info['bg_collision_point_count'] = int(bg_collision_points)
+        info['bg_collision_point_threshold'] = int(BG_COLLISION_POINT_THRESHOLD)
         info['fg_collision'] = bool(fg_collision)
         info['off_route']    = off_route
         info['route_complete'] = bool(route_complete)
