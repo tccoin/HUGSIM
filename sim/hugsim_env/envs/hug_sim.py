@@ -23,6 +23,7 @@ import open3d as o3d
 
 from gs_world.planning_agents.gaia_e2e.camera_geometry import (
     FLU_TO_RDF,
+    hugsim_cam_to_vehicle_to_pose_sv,
     pose_sv_to_hugsim_cam_to_vehicle,
 )
 from gs_world.utils.rotation import quaternion_wxyz_to_matrix, rotvec_to_matrix
@@ -169,6 +170,48 @@ class HUGSimEnv(gymnasium.Env):
                     height_correction=str(sg_cfg.get('height_correction', 'recorded')),
                     timeout_s=float(sg_cfg.get('timeout_s', 60.0)),
                 )
+            elif backend_name == 'dggt':
+                from gs_world.simulation.dggt_render_backend import DGGTRenderBackend
+                self.sg_backend = DGGTRenderBackend(
+                    work_item=str(sg_cfg.work_item),
+                    checkpoint=str(sg_cfg.checkpoint),
+                    processed_root=str(sg_cfg.processed_root),
+                    trajectory_root=str(sg_cfg.trajectory_root),
+                    cache_root=str(sg_cfg.cache_root),
+                    dynamic_mask_root=str(
+                        sg_cfg.get('dynamic_mask_root', '')),
+                    dynamic_masks_enabled=bool(
+                        sg_cfg.get('dynamic_masks_enabled', False)),
+                    dynamic_masks_required=bool(
+                        sg_cfg.get('dynamic_masks_required', False)),
+                    input_crops=OmegaConf.to_container(
+                        sg_cfg.get('input_crops'), resolve=True
+                    ) if sg_cfg.get('input_crops') else {},
+                    reconstruction_fps=float(
+                        sg_cfg.get('reconstruction_fps', 10.0)),
+                    context_duration_s=float(
+                        sg_cfg.get('context_duration_s', 2.0)),
+                    overlap_duration_s=float(
+                        sg_cfg.get('overlap_duration_s', 0.5)),
+                    static_temporal_sigma_max=float(
+                        sg_cfg.get('static_temporal_sigma_max', 0.0)),
+                    static_scene=bool(sg_cfg.get('static_scene', False)),
+                    pose_graph=bool(sg_cfg.get('pose_graph', False)),
+                    overlap_pose_averaging=bool(
+                        sg_cfg.get('overlap_pose_averaging', False)),
+                    trajectory_visualization=bool(
+                        sg_cfg.get('trajectory_visualization', False)),
+                    save_cache=bool(sg_cfg.get('save_cache', False)),
+                    max_frame_gaussian_exports=int(
+                        sg_cfg.get('max_frame_gaussian_exports', 0)),
+                    sky_mode=str(sg_cfg.get('sky_mode', 'model')),
+                    use_sky_masks=bool(sg_cfg.get('use_sky_masks', False)),
+                    persistent_sky=bool(sg_cfg.get('persistent_sky', False)),
+                    window_alignment=str(sg_cfg.get('window_alignment', 'overlap')),
+                    scene_spec=OmegaConf.to_container(
+                        sg_cfg.get('scene_spec'), resolve=True)
+                    if sg_cfg.get('scene_spec') else None,
+                )
             else:
                 from gs_world.simulation.sg_render_backend import SGRenderBackend
                 self.sg_backend = SGRenderBackend(
@@ -216,12 +259,15 @@ class HUGSimEnv(gymnasium.Env):
             else:
                 ground_xyz, scene_xyz = self._extract_pointclouds_from_sg()
 
-        ground_pcd = o3d.geometry.PointCloud()
-        ground_pcd.points = o3d.utility.Vector3dVector(ground_xyz.astype(float))
-        o3d.io.write_point_cloud(os.path.join(output, 'ground.ply'), ground_pcd)
-        scene_pcd = o3d.geometry.PointCloud()
-        scene_pcd.points = o3d.utility.Vector3dVector(scene_xyz.astype(float))
-        o3d.io.write_point_cloud(os.path.join(output, 'scene.ply'), scene_pcd)
+        persist_pointclouds = not self.sg_enabled or bool(
+            getattr(self.sg_backend, 'persist_pointcloud_artifacts', True))
+        if persist_pointclouds:
+            ground_pcd = o3d.geometry.PointCloud()
+            ground_pcd.points = o3d.utility.Vector3dVector(ground_xyz.astype(float))
+            o3d.io.write_point_cloud(os.path.join(output, 'ground.ply'), ground_pcd)
+            scene_pcd = o3d.geometry.PointCloud()
+            scene_pcd.points = o3d.utility.Vector3dVector(scene_xyz.astype(float))
+            o3d.io.write_point_cloud(os.path.join(output, 'scene.ply'), scene_pcd)
 
         if cfg.scenario.load_HD_map:
             self.planner.update_agent_route()
@@ -684,6 +730,9 @@ class HUGSimEnv(gymnasium.Env):
 
     def sg_log_time_bounds(self, fps=10.0):
         assert self.sg_backend is not None, "sg_log_time_bounds requires SG mode"
+        backend_bounds = getattr(self.sg_backend, 'log_time_bounds_s', None)
+        if callable(backend_bounds):
+            return tuple(float(value) for value in backend_bounds())
         front_cam_id = self.sg_backend.cam_id_for_name('CAM_FRONT')
         frames = [
             int(cam.meta.get('frame_idx', 0))
@@ -841,8 +890,6 @@ class HUGSimEnv(gymnasium.Env):
 
         cam_params = {}
         for cam_name in camera_names:
-            if cam_name == 'CAM_BACK':
-                continue
             cam = None
             sg_id = self.sg_backend.cam_id_for_name(cam_name)
             synthesize_front_tele = (
@@ -890,6 +937,11 @@ class HUGSimEnv(gymnasium.Env):
                 'v2c': v2c,
                 'l2c': v2c.copy(),
                 'sg_render': True,
+                'dynamic_intrinsics': bool(
+                    callable(getattr(
+                        self.sg_backend, 'camera_intrinsic_at_time', None))
+                    and not use_gaia_pinhole_intrinsic
+                ),
             }
             if use_gaia_rig and gaia_name is not None:
                 pose_sv = gaia_pose_sv[gaia_name].copy()
@@ -902,9 +954,12 @@ class HUGSimEnv(gymnasium.Env):
                 cam_params[cam_name]['camera_model'] = 'PINHOLE'
                 cam_params[cam_name]['distortion'] = np.zeros(0, dtype=np.float32)
             is_alpasim_scene = getattr(self.sg_backend, 'dataset_type', '') == 'alpasim'
+            is_dggt_scene = getattr(self.sg_backend, 'dataset_type', '') == 'dggt'
+            uses_absolute_dataset_camera_pose = (
+                getattr(self.sg_backend, 'dataset_type', '') in ('alpasim', 'dggt'))
             if use_dataset_cam_to_vehicle and cam is not None:
                 render_vehicle_to_camera = np.asarray(cam.extrinsic, dtype=np.float64).copy()
-                if is_alpasim_scene:
+                if uses_absolute_dataset_camera_pose:
                     cam_params[cam_name]['vehicle_to_camera'] = render_vehicle_to_camera.copy()
                 agent_cam_to_vehicle = render_vehicle_to_camera.copy()
                 if is_alpasim_scene:
@@ -915,6 +970,10 @@ class HUGSimEnv(gymnasium.Env):
                         [0.0, -1.0, 0.0],
                     ], dtype=np.float64)
                     agent_cam_to_vehicle = hugsim_to_navsim @ agent_cam_to_vehicle
+                elif is_dggt_scene:
+                    pose_sv = hugsim_cam_to_vehicle_to_pose_sv(agent_cam_to_vehicle)
+                    cam_params[cam_name]['pose_SV'] = pose_sv
+                    agent_cam_to_vehicle = np.linalg.inv(pose_sv)
                 cam_params[cam_name]['agent_cam_to_vehicle'] = agent_cam_to_vehicle
 
         # Waymo perception SG scenes have no rear training camera. Keep a
@@ -1037,7 +1096,7 @@ class HUGSimEnv(gymnasium.Env):
         dt = max(abs(f1 - f0) / float(fps), 1e-6)
         return float(np.linalg.norm(p1[[0, 2]] - p0[[0, 2]]) / dt)
 
-    def kinematic_step(self, plan_first_local):
+    def kinematic_step(self, plan_first_local, exact_pose_hugsim=None):
         """Teleport the ego to the first waypoint of the agent's plan + its
         heading, advance the clock by ``self.dt``, return new obs/info.
 
@@ -1050,6 +1109,7 @@ class HUGSimEnv(gymnasium.Env):
             — first waypoint of the plan, in ego-local lidar coordinates
             with NAVSIM-convention heading (CCW from forward, +left).
         """
+        previous_pose = self.ego.copy()
         self.timestamp += self.dt
         if self.planner is not None:
             self.render_kwargs['planning'] = self.planner.plan_traj(self.timestamp, self.ego_state)
@@ -1064,26 +1124,45 @@ class HUGSimEnv(gymnasium.Env):
         # HUGSIM yaw is +CW=+right (positive yaw rotates forward toward +x =
         # right), so the two yaw conventions are *opposite sign*.
         theta = float(self.vr[1])
-        c, s = math.cos(theta), math.sin(theta)
-        # R_y(θ) applied to (x_right, 0, y_fwd):
-        #   world_x = x_right*cos(θ) + y_fwd*sin(θ)
-        #   world_z = -x_right*sin(θ) + y_fwd*cos(θ)
-        d_vab0 = x_right * c + y_fwd * s
-        d_vab1 = -x_right * s + y_fwd * c
-
-        self.vab[0] += d_vab0
-        self.vab[1] += d_vab1
-        # Flip sign: NAVSIM CCW-positive heading → HUGSIM CW-positive yaw.
-        self.vr[1] = theta - h_navsim
+        if exact_pose_hugsim is not None:
+            if not self._use_exact_ego_pose:
+                raise RuntimeError(
+                    'exact_pose_hugsim requires use_exact_ego_pose')
+            exact_pose = np.asarray(exact_pose_hugsim, dtype=np.float64)
+            if exact_pose.shape != (4, 4):
+                raise ValueError('exact_pose_hugsim must be a 4x4 matrix')
+            self._exact_ego_pose = exact_pose.copy()
+            pos = exact_pose[:3, 3]
+            fwd = exact_pose[:3, 2]
+            self.vab[:] = [float(pos[0]), float(pos[2])]
+            self.vr[1] = math.atan2(float(fwd[0]), float(fwd[2]))
+            d_vab0 = float(pos[0] - previous_pose[0, 3])
+            d_vab1 = float(pos[2] - previous_pose[2, 3])
+            heading_delta = math.atan2(
+                math.sin(float(self.vr[1]) - theta),
+                math.cos(float(self.vr[1]) - theta),
+            )
+        else:
+            self._exact_ego_pose = None
+            c, s = math.cos(theta), math.sin(theta)
+            # R_y(θ) applied to (x_right, 0, y_fwd):
+            #   world_x = x_right*cos(θ) + y_fwd*sin(θ)
+            #   world_z = -x_right*sin(θ) + y_fwd*cos(θ)
+            d_vab0 = x_right * c + y_fwd * s
+            d_vab1 = -x_right * s + y_fwd * c
+            self.vab[0] += d_vab0
+            self.vab[1] += d_vab1
+            # Flip sign: NAVSIM CCW-positive heading → HUGSIM CW-positive yaw.
+            self.vr[1] = theta - h_navsim
+            heading_delta = -h_navsim
 
         # Update velo / steer from this kinematic jump so future ego_status
         # inputs to the agent reflect the motion. Bicycle inverse-kinematics
         # for steer: θ̇ = v·tan(δ)/L → δ = atan(θ̇·L / max(v, ε)).
-        # Sign also flipped on theta_dot (NAVSIM → HUGSIM).
         distance = math.sqrt(d_vab0 * d_vab0 + d_vab1 * d_vab1)
         self.velo = distance / max(self.dt, 1e-6)
         L = self.kinematic['Lr'] + self.kinematic['Lf']
-        theta_dot = -h_navsim / max(self.dt, 1e-6)
+        theta_dot = heading_delta / max(self.dt, 1e-6)
         self.steer = math.atan2(theta_dot * L, max(self.velo, 1e-3))
         self.last_accel = 0.0
         self.last_steer_rate = 0.0
@@ -1094,14 +1173,20 @@ class HUGSimEnv(gymnasium.Env):
         # that the plan is poor, not just controller error.
         terminated = False
         reward = 0
+        collision_supported = bool(
+            getattr(self.sg_backend, 'collision_supported', True))
         verts = (self.ego[:3, :3] @ self.ego_verts.T).T + self.ego[:3, 3]
         verts = torch.from_numpy(verts.astype(np.float32)).cuda()
-        bg_collision_points = bg_collision_point_count(self.points, verts)
+        bg_collision_points = (
+            bg_collision_point_count(self.points, verts)
+            if collision_supported else 0)
         bg_collision = bg_collision_points > BG_COLLISION_POINT_THRESHOLD
         if bg_collision:
             terminated = True
             print('Collision with background (kinematic_only)')
-        fg_collision = fg_collision_det(self.ego_box, self.objs_list)
+        fg_collision = (
+            fg_collision_det(self.ego_box, self.objs_list)
+            if collision_supported else False)
         if fg_collision:
             terminated = True
             print('Collision with foreground (kinematic_only)')
@@ -1132,6 +1217,7 @@ class HUGSimEnv(gymnasium.Env):
         info['bg_collision_point_count'] = int(bg_collision_points)
         info['bg_collision_point_threshold'] = int(BG_COLLISION_POINT_THRESHOLD)
         info['fg_collision'] = bool(fg_collision)
+        info['collision_supported'] = collision_supported
         info['off_route']    = off_route
         info['route_complete'] = bool(route_complete)
         info['log_complete'] = bool(log_complete)
@@ -1187,6 +1273,17 @@ class HUGSimEnv(gymnasium.Env):
         v2front = self.cam_params['CAM_FRONT']['v2c']
         for cam_name, params in self.cam_params.items():
             intrinsic = params['intrinsic']
+            if params.get('dynamic_intrinsics', False):
+                intrinsic_at_time = getattr(
+                    self.sg_backend, 'camera_intrinsic_at_time', None)
+                dynamic_intrinsic = intrinsic_at_time(
+                    self.timestamp,
+                    cam_name,
+                    (int(intrinsic['W']), int(intrinsic['H'])),
+                )
+                if dynamic_intrinsic is not None:
+                    intrinsic = dynamic_intrinsic
+                    params['intrinsic'] = dynamic_intrinsic
             H, W = int(intrinsic['H']), int(intrinsic['W'])
             v2c = params['v2c']
             if params.get('sg_render', True):
@@ -1257,7 +1354,9 @@ class HUGSimEnv(gymnasium.Env):
         self.last_steer_rate = 0
         self.timestamp = 0
 
-        if self.planner is not None:
+        if self.sg_backend is not None and self._use_exact_ego_pose:
+            self._set_sg_state_at_time(0.0)
+        elif self.planner is not None:
             self.render_kwargs['planning'] = self.planner.plan_traj(self.timestamp, self.ego_state)
 
         observation = self._get_obs()
@@ -1279,20 +1378,27 @@ class HUGSimEnv(gymnasium.Env):
         self.vab[0] = self.vab[0] + self.velo * np.sin(theta) * self.dt
         self.vab[1] = self.vab[1] + self.velo * np.cos(theta) * self.dt
         self.vr[1] = theta + self.velo * np.tan(self.steer) / L * self.dt
+        self._exact_ego_pose = None
 
         terminated = False
         reward = 0
         verts = (self.ego[:3, :3] @ self.ego_verts.T).T + self.ego[:3, 3]
         verts = torch.from_numpy(verts.astype(np.float32)).cuda()
         
-        bg_collision_points = bg_collision_point_count(self.points, verts)
+        collision_supported = bool(
+            getattr(self.sg_backend, 'collision_supported', True))
+        bg_collision_points = (
+            bg_collision_point_count(self.points, verts)
+            if collision_supported else 0)
         bg_collision = bg_collision_points > BG_COLLISION_POINT_THRESHOLD
         if bg_collision:
             terminated = True
             print('Collision with background')
             reward = -100
 
-        fg_collision = fg_collision_det(self.ego_box, self.objs_list)
+        fg_collision = (
+            fg_collision_det(self.ego_box, self.objs_list)
+            if collision_supported else False)
         if fg_collision:
             terminated = True
             print('Collision with foreground')
@@ -1325,6 +1431,7 @@ class HUGSimEnv(gymnasium.Env):
         info['bg_collision_point_count'] = int(bg_collision_points)
         info['bg_collision_point_threshold'] = int(BG_COLLISION_POINT_THRESHOLD)
         info['fg_collision'] = bool(fg_collision)
+        info['collision_supported'] = collision_supported
         info['off_route']    = off_route
         info['route_complete'] = bool(route_complete)
         info['log_complete'] = bool(log_complete)
