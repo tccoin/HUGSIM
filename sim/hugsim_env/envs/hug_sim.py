@@ -184,6 +184,8 @@ class HUGSimEnv(gymnasium.Env):
                         sg_cfg.get('dynamic_masks_enabled', False)),
                     dynamic_masks_required=bool(
                         sg_cfg.get('dynamic_masks_required', False)),
+                    dynamic_masks_hard_partition=bool(
+                        sg_cfg.get('dynamic_masks_hard_partition', False)),
                     input_crops=OmegaConf.to_container(
                         sg_cfg.get('input_crops'), resolve=True
                     ) if sg_cfg.get('input_crops') else {},
@@ -198,6 +200,22 @@ class HUGSimEnv(gymnasium.Env):
                     static_scene=bool(sg_cfg.get('static_scene', False)),
                     render_dynamic_gaussians=bool(
                         sg_cfg.get('render_dynamic_gaussians', True)),
+                    dynamic_gaussian_max_scale_over_depth=float(
+                        sg_cfg.get(
+                            'dynamic_gaussian_max_scale_over_depth', 0.0)),
+                    dynamic_gaussian_head_checkpoint=str(
+                        sg_cfg.get(
+                            'dynamic_gaussian_head_checkpoint', '')),
+                    object_4d_enabled=bool(
+                        sg_cfg.get('object_4d_enabled', False)),
+                    object_4d_speed_threshold_mps=float(
+                        sg_cfg.get('object_4d_speed_threshold_mps', 1.0)),
+                    object_4d_max_objects=int(
+                        sg_cfg.get('object_4d_max_objects', 16)),
+                    object_4d_max_tokens_per_object=int(
+                        sg_cfg.get('object_4d_max_tokens_per_object', 64)),
+                    object_4d_cross_window_blend=bool(
+                        sg_cfg.get('object_4d_cross_window_blend', True)),
                     pose_graph=bool(sg_cfg.get('pose_graph', False)),
                     overlap_pose_averaging=bool(
                         sg_cfg.get('overlap_pose_averaging', False)),
