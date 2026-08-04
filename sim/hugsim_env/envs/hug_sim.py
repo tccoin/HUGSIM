@@ -205,12 +205,80 @@ class HUGSimEnv(gymnasium.Env):
                     max_frame_gaussian_exports=int(
                         sg_cfg.get('max_frame_gaussian_exports', 0)),
                     sky_mode=str(sg_cfg.get('sky_mode', 'model')),
+                    sky_horizon_fill_fraction=float(
+                        sg_cfg.get('sky_horizon_fill_fraction', 0.0)),
                     use_sky_masks=bool(sg_cfg.get('use_sky_masks', False)),
                     persistent_sky=bool(sg_cfg.get('persistent_sky', False)),
                     window_alignment=str(sg_cfg.get('window_alignment', 'overlap')),
+                    static_source_mode=str(
+                        sg_cfg.get('static_source_mode', 'all')),
+                    external_intrinsics=bool(
+                        sg_cfg.get('external_intrinsics', False)),
+                    external_trajectory=bool(
+                        sg_cfg.get('external_trajectory', False)),
+                    cross_window_merge=bool(
+                        sg_cfg.get('cross_window_merge', False)),
+                    global_execution=bool(
+                        sg_cfg.get('global_execution', False)),
+                    global_intrinsics_mode=str(
+                        sg_cfg.get('global_intrinsics_mode', 'window_model')),
+                    global_pose_correction_mode=str(
+                        sg_cfg.get(
+                            'global_pose_correction_mode', 'height_locked')),
+                    global_align_static_height=bool(
+                        sg_cfg.get('global_align_static_height', False)),
+                    global_static_temporal_gate=bool(
+                        sg_cfg.get('global_static_temporal_gate', False)),
+                    global_temporal_ownership=bool(
+                        sg_cfg.get('global_temporal_ownership', False)),
+                    cross_window_max_distance_difference_m=float(
+                        sg_cfg.get(
+                            'cross_window_max_distance_difference_m', 5.0)),
+                    cross_window_min_scale_overlap_pose_count=int(
+                        sg_cfg.get(
+                            'cross_window_min_scale_overlap_pose_count', 3)),
+                    cross_window_voxelization=bool(
+                        sg_cfg.get('cross_window_voxelization', True)),
+                    cross_window_initial_voxel_size_m=float(
+                        sg_cfg.get('cross_window_initial_voxel_size_m', 0.1)),
+                    cross_window_target_n_gaussians=int(
+                        sg_cfg.get(
+                            'cross_window_target_n_gaussians', 2_000_000)),
+                    cross_window_max_voxelization_iterations=int(
+                        sg_cfg.get(
+                            'cross_window_max_voxelization_iterations', 20)),
                     scene_spec=OmegaConf.to_container(
                         sg_cfg.get('scene_spec'), resolve=True)
                     if sg_cfg.get('scene_spec') else None,
+                )
+            elif backend_name == 'instant_nurec':
+                from gs_world.simulation.instant_nurec_render_backend import (
+                    InstantNuRecRenderBackend,
+                )
+                self.sg_backend = InstantNuRecRenderBackend(
+                    work_item=str(sg_cfg.work_item),
+                    scene_spec=OmegaConf.to_container(
+                        sg_cfg.scene_spec, resolve=True),
+                    checkpoint=str(sg_cfg.checkpoint),
+                    cache_root=str(sg_cfg.cache_root),
+                    generator_python=str(sg_cfg.generator_python),
+                    model=str(sg_cfg.model),
+                    context_cameras=list(sg_cfg.context_cameras),
+                    cameras=OmegaConf.to_container(
+                        sg_cfg.cameras, resolve=True),
+                    max_chunks=int(sg_cfg.max_chunks),
+                    context_duration_s=(
+                        float(sg_cfg.context_duration_s)
+                        if sg_cfg.context_duration_s is not None
+                        else None
+                    ),
+                    n_gaussians=int(sg_cfg.n_gaussians),
+                    dynamic_min_opacity=float(sg_cfg.dynamic_min_opacity),
+                    dynamic_track_semantic_gate=bool(
+                        sg_cfg.dynamic_track_semantic_gate
+                    ),
+                    reconstruct_on_miss=bool(sg_cfg.reconstruct_on_miss),
+                    background_color=list(sg_cfg.background_color),
                 )
             else:
                 from gs_world.simulation.sg_render_backend import SGRenderBackend
@@ -954,9 +1022,17 @@ class HUGSimEnv(gymnasium.Env):
                 cam_params[cam_name]['camera_model'] = 'PINHOLE'
                 cam_params[cam_name]['distortion'] = np.zeros(0, dtype=np.float32)
             is_alpasim_scene = getattr(self.sg_backend, 'dataset_type', '') == 'alpasim'
-            is_dggt_scene = getattr(self.sg_backend, 'dataset_type', '') == 'dggt'
-            uses_absolute_dataset_camera_pose = (
-                getattr(self.sg_backend, 'dataset_type', '') in ('alpasim', 'dggt'))
+            uses_pose_sv_camera_contract = (
+                getattr(self.sg_backend, 'dataset_type', '')
+                in ('dggt', 'instant_nurec')
+            )
+            uses_absolute_dataset_camera_pose = bool(
+                getattr(
+                    self.sg_backend,
+                    'uses_absolute_dataset_camera_pose',
+                    getattr(self.sg_backend, 'dataset_type', '') in ('alpasim', 'dggt'),
+                )
+            )
             if use_dataset_cam_to_vehicle and cam is not None:
                 render_vehicle_to_camera = np.asarray(cam.extrinsic, dtype=np.float64).copy()
                 if uses_absolute_dataset_camera_pose:
@@ -970,7 +1046,7 @@ class HUGSimEnv(gymnasium.Env):
                         [0.0, -1.0, 0.0],
                     ], dtype=np.float64)
                     agent_cam_to_vehicle = hugsim_to_navsim @ agent_cam_to_vehicle
-                elif is_dggt_scene:
+                elif uses_pose_sv_camera_contract:
                     pose_sv = hugsim_cam_to_vehicle_to_pose_sv(agent_cam_to_vehicle)
                     cam_params[cam_name]['pose_SV'] = pose_sv
                     agent_cam_to_vehicle = np.linalg.inv(pose_sv)
