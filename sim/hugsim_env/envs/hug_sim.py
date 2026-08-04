@@ -196,6 +196,8 @@ class HUGSimEnv(gymnasium.Env):
                     static_temporal_sigma_max=float(
                         sg_cfg.get('static_temporal_sigma_max', 0.0)),
                     static_scene=bool(sg_cfg.get('static_scene', False)),
+                    render_dynamic_gaussians=bool(
+                        sg_cfg.get('render_dynamic_gaussians', True)),
                     pose_graph=bool(sg_cfg.get('pose_graph', False)),
                     overlap_pose_averaging=bool(
                         sg_cfg.get('overlap_pose_averaging', False)),
