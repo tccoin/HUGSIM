@@ -271,6 +271,52 @@ class HUGSimEnv(gymnasium.Env):
                         sg_cfg.get('scene_spec'), resolve=True)
                     if sg_cfg.get('scene_spec') else None,
                 )
+            elif backend_name == 'instant_gs_world':
+                from gs_world.simulation.instant_gs_world_render_backend import (
+                    InstantGSWorldRenderBackend,
+                )
+                self.sg_backend = InstantGSWorldRenderBackend(
+                    work_item=str(sg_cfg.work_item),
+                    checkpoint=str(sg_cfg.checkpoint),
+                    pi3x_checkpoint=str(sg_cfg.pi3x_checkpoint),
+                    pi3x_source_root=str(sg_cfg.pi3x_source_root),
+                    processed_root=str(sg_cfg.processed_root),
+                    cache_root=str(sg_cfg.cache_root),
+                    target_fps=float(sg_cfg.target_fps),
+                    inference_window_count=int(
+                        sg_cfg.get('inference_window_count', 1)),
+                    chunk_selection_strategy=str(
+                        sg_cfg.get(
+                            'chunk_selection_strategy',
+                            'bev_source_topk')),
+                    chunk_selection_bev_cell_size_m=float(
+                        sg_cfg.get(
+                            'chunk_selection_bev_cell_size_m', 8.0)),
+                    chunk_selection_source_topk=int(
+                        sg_cfg.get('chunk_selection_source_topk', 2)),
+                    chunk_selection_fill_voxel_size_m=float(
+                        sg_cfg.get(
+                            'chunk_selection_fill_voxel_size_m', 0.25)),
+                    metric_scale_strategy=str(
+                        sg_cfg.get('metric_scale_strategy', 'per_chunk')),
+                    terminal_merge_strategy=str(
+                        sg_cfg.get('terminal_merge_strategy', 'hard_kl')),
+                    episode_pose_strategy=str(
+                        sg_cfg.get('episode_pose_strategy', 'dataset_gt')),
+                    static_render_strategy=str(
+                        sg_cfg.get('static_render_strategy', 'merged')),
+                    waymo_gt_objects_enabled=bool(
+                        sg_cfg.get('waymo_gt_objects_enabled', False)),
+                    camera_layer_enabled=bool(
+                        sg_cfg.get('camera_layer_enabled', True)),
+                    diagnostic=bool(sg_cfg.get('diagnostic', False)),
+                    input_crops=OmegaConf.to_container(
+                        sg_cfg.get('input_crops'), resolve=True
+                    ) if sg_cfg.get('input_crops') else {},
+                    scene_spec=OmegaConf.to_container(
+                        sg_cfg.get('scene_spec'), resolve=True)
+                    if sg_cfg.get('scene_spec') else None,
+                )
             elif backend_name == 'instant_nurec':
                 from gs_world.simulation.instant_nurec_render_backend import (
                     InstantNuRecRenderBackend,
@@ -1044,7 +1090,7 @@ class HUGSimEnv(gymnasium.Env):
             is_alpasim_scene = getattr(self.sg_backend, 'dataset_type', '') == 'alpasim'
             uses_pose_sv_camera_contract = (
                 getattr(self.sg_backend, 'dataset_type', '')
-                in ('dggt', 'instant_nurec')
+                in ('dggt', 'instant_gs_world', 'instant_nurec')
             )
             uses_absolute_dataset_camera_pose = bool(
                 getattr(
