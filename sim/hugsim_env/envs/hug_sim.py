@@ -299,14 +299,75 @@ class HUGSimEnv(gymnasium.Env):
                             'chunk_selection_fill_voxel_size_m', 0.25)),
                     metric_scale_strategy=str(
                         sg_cfg.get('metric_scale_strategy', 'per_chunk')),
+                    within_chunk_static_strategy=str(
+                        sg_cfg.get(
+                            'within_chunk_static_strategy',
+                            'voxel_fusion')),
                     terminal_merge_strategy=str(
                         sg_cfg.get('terminal_merge_strategy', 'hard_kl')),
                     episode_pose_strategy=str(
                         sg_cfg.get('episode_pose_strategy', 'dataset_gt')),
                     static_render_strategy=str(
                         sg_cfg.get('static_render_strategy', 'merged')),
+                    tracked_render_strategy=str(
+                        sg_cfg.get('tracked_render_strategy', 'best_view_event')),
+                    tracked_probability_threshold_override=float(
+                        sg_cfg.get(
+                            'tracked_probability_threshold_override', -1.0)),
+                    tracked_optical_thickness_scale=float(
+                        sg_cfg.get('tracked_optical_thickness_scale', 1.0)),
+                    tracked_covariance_scale=float(
+                        sg_cfg.get('tracked_covariance_scale', 1.0)),
+                    sky_render_mode=str(
+                        sg_cfg.get('sky_render_mode', 'checkpoint')),
+                    render_timing_breakdown=bool(
+                        sg_cfg.get('render_timing_breakdown', False)),
+                    sky_lut_enabled=bool(
+                        sg_cfg.get('sky_lut_enabled', True)),
+                    tracked_event_trace=bool(
+                        sg_cfg.get('tracked_event_trace', False)),
+                    tracked_event_trace_tracks=str(
+                        sg_cfg.get('tracked_event_trace_tracks', '')),
+                    tracked_box_clip_margin=float(
+                        sg_cfg.get('tracked_box_clip_margin', 0.0)),
+                    moving_residual_probability_threshold_override=float(
+                        sg_cfg.get(
+                            'moving_residual_probability_threshold_override',
+                            -1.0)),
+                    evaluation_stage=str(
+                        sg_cfg.get('evaluation_stage', 'final_joint')),
                     waymo_gt_objects_enabled=bool(
                         sg_cfg.get('waymo_gt_objects_enabled', False)),
+                    object_gaussian_head_checkpoint=str(
+                        sg_cfg.get('object_gaussian_head_checkpoint', '')),
+                    source_identity_exclusion_enabled=bool(
+                        sg_cfg.get(
+                            'source_identity_exclusion_enabled', False)),
+                    source_identity_exclusion_required=bool(
+                        sg_cfg.get(
+                            'source_identity_exclusion_required', False)),
+                    source_identity_exclusion_policy=str(
+                        sg_cfg.get(
+                            'source_identity_exclusion_policy',
+                            'all_instances')),
+                    source_identity_teacher_mask_root=str(
+                        sg_cfg.get('source_identity_teacher_mask_root', '')),
+                    source_identity_exclusion_label=str(
+                        sg_cfg.get('source_identity_exclusion_label', '')),
+                    source_identity_moving_speed_threshold_mps=float(
+                        sg_cfg.get(
+                            'source_identity_moving_speed_threshold_mps',
+                            -1.0)),
+                    source_identity_exclusion_dilation_px=int(
+                        sg_cfg.get(
+                            'source_identity_exclusion_dilation_px', 0)),
+                    source_identity_exclusion_temporal_radius=int(
+                        sg_cfg.get(
+                            'source_identity_exclusion_temporal_radius', 0)),
+                    tracked_layer_enabled=bool(
+                        sg_cfg.get('tracked_layer_enabled', True)),
+                    untracked_layer_enabled=bool(
+                        sg_cfg.get('untracked_layer_enabled', True)),
                     camera_layer_enabled=bool(
                         sg_cfg.get('camera_layer_enabled', True)),
                     diagnostic=bool(sg_cfg.get('diagnostic', False)),
