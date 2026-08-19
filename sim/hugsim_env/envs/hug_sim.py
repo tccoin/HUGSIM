@@ -407,6 +407,25 @@ class HUGSimEnv(gymnasium.Env):
                     reconstruct_on_miss=bool(sg_cfg.reconstruct_on_miss),
                     background_color=list(sg_cfg.background_color),
                 )
+            elif backend_name == 'spz':
+                from gs_world.simulation.spz_render_backend import SpzRenderBackend
+                self.sg_backend = SpzRenderBackend(
+                    source_path=str(sg_cfg.source_path),
+                    trajectory_scene=str(sg_cfg.trajectory_scene),
+                    processed_root=str(sg_cfg.processed_root),
+                    cameras=OmegaConf.to_container(
+                        sg_cfg.cameras, resolve=True),
+                    lod=OmegaConf.to_container(sg_cfg.lod, resolve=True),
+                    oracle_trajectory=OmegaConf.to_container(
+                        sg_cfg.oracle_trajectory, resolve=True),
+                    camera_height_offset_m=float(
+                        sg_cfg.camera_height_offset_m),
+                    sh_degree=int(sg_cfg.sh_degree),
+                    scale_multiplier=float(sg_cfg.scale_multiplier),
+                    background_color=list(sg_cfg.background_color),
+                    world_from_spz=OmegaConf.to_container(
+                        sg_cfg.world_from_spz, resolve=True),
+                )
             else:
                 from gs_world.simulation.sg_render_backend import SGRenderBackend
                 self.sg_backend = SGRenderBackend(
@@ -1151,7 +1170,7 @@ class HUGSimEnv(gymnasium.Env):
             is_alpasim_scene = getattr(self.sg_backend, 'dataset_type', '') == 'alpasim'
             uses_pose_sv_camera_contract = (
                 getattr(self.sg_backend, 'dataset_type', '')
-                in ('dggt', 'instant_gs_world', 'instant_nurec')
+                in ('dggt', 'instant_gs_world', 'instant_nurec', 'spz')
             )
             uses_absolute_dataset_camera_pose = bool(
                 getattr(
