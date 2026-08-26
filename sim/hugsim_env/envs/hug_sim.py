@@ -23,6 +23,8 @@ import open3d as o3d
 
 from gs_world.planning_agents.gaia_e2e.camera_geometry import (
     FLU_TO_RDF,
+    PD_NX_1DAT_CAMERA_TO_VEHICLE_HUGSIM,
+    PD_NX_1DAT_PINHOLE_INTRINSICS,
     hugsim_cam_to_vehicle_to_pose_sv,
     pose_sv_to_hugsim_cam_to_vehicle,
 )
@@ -33,10 +35,10 @@ def _focal2fov(focal, pixels):
     return 2.0 * math.atan(float(pixels) / (2.0 * float(focal)))
 
 
-def _validate_sg_native_rig_config(use_gaia_rig, use_dataset_cam_to_vehicle):
-    if use_gaia_rig and use_dataset_cam_to_vehicle:
+def _validate_sg_native_rig_config(use_virtual_rig, use_dataset_cam_to_vehicle):
+    if use_virtual_rig and use_dataset_cam_to_vehicle:
         raise ValueError(
-            'rig_mode=gaia cannot use dataset cam-to-vehicle extrinsics'
+            'a virtual render rig cannot use dataset cam-to-vehicle extrinsics'
         )
 
 
@@ -78,6 +80,52 @@ def _load_gaia_pinhole_intrinsic(camera_info_dir, camera_name, image_size):
         'cx': cx,
         'cy': cy,
     }
+
+
+def _load_fixed_pinhole_intrinsic(spec, image_size):
+    """Scale an explicit source-resolution pinhole K to the render canvas."""
+    target_w, target_h = int(image_size[0]), int(image_size[1])
+    native_w = float(spec['width'])
+    native_h = float(spec['height'])
+    if native_w <= 0.0 or native_h <= 0.0:
+        raise ValueError('fixed pinhole intrinsic width/height must be positive')
+    sx, sy = target_w / native_w, target_h / native_h
+    fx, fy = float(spec['fx']) * sx, float(spec['fy']) * sy
+    return {
+        'H': target_h,
+        'W': target_w,
+        'fovx': _focal2fov(fx, target_w),
+        'fovy': _focal2fov(fy, target_h),
+        'cx': float(spec['cx']) * sx,
+        'cy': float(spec['cy']) * sy,
+    }
+
+
+def _load_fixed_camera_to_vehicle_hugsim(spec, camera_name):
+    """Validate an explicit camera-to-vehicle pose in HUGSim coordinates."""
+    pose = np.asarray(spec, dtype=np.float64)
+    if pose.shape != (4, 4):
+        raise ValueError(
+            f'fixed_camera_to_vehicle_hugsim[{camera_name}] must be 4x4'
+        )
+    if not np.isfinite(pose).all():
+        raise ValueError(
+            f'fixed_camera_to_vehicle_hugsim[{camera_name}] must be finite'
+        )
+    if not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8):
+        raise ValueError(
+            f'fixed_camera_to_vehicle_hugsim[{camera_name}] has invalid last row'
+        )
+    rotation = pose[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5):
+        raise ValueError(
+            f'fixed_camera_to_vehicle_hugsim[{camera_name}] rotation is not orthonormal'
+        )
+    if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5):
+        raise ValueError(
+            f'fixed_camera_to_vehicle_hugsim[{camera_name}] rotation determinant is not +1'
+        )
+    return pose
 
 
 def fg_collision_det(ego_box, objs):
@@ -956,26 +1004,114 @@ class HUGSimEnv(gymnasium.Env):
         rig_mode = str(agent_sg_native.get('rig_mode', '')).strip().lower()
         if not rig_mode:
             rig_mode = 'gaia' if legacy_render_gaia_rig else 'hugsim'
-        if rig_mode not in ('hugsim', 'gaia'):
-            raise ValueError("agent_sg_native.rig_mode must be 'hugsim' or 'gaia'")
+        if rig_mode not in ('hugsim', 'gaia', 'pd'):
+            raise ValueError(
+                "agent_sg_native.rig_mode must be 'hugsim', 'gaia', or 'pd'"
+            )
         use_gaia_rig = rig_mode == 'gaia'
-        _validate_sg_native_rig_config(use_gaia_rig, use_dataset_cam_to_vehicle)
+        use_pd_rig = rig_mode == 'pd'
+        _validate_sg_native_rig_config(
+            use_gaia_rig or use_pd_rig, use_dataset_cam_to_vehicle
+        )
+        anchor_virtual_rig_to_dataset_front = bool(
+            agent_sg_native.get(
+                'anchor_virtual_rig_to_dataset_front',
+                agent_sg_native.get('anchor_gaia_rig_to_dataset_front', False),
+            )
+        )
+        if (
+            anchor_virtual_rig_to_dataset_front
+            and not (use_gaia_rig or use_pd_rig)
+        ):
+            raise ValueError(
+                'anchor_virtual_rig_to_dataset_front requires '
+                'rig_mode=gaia or rig_mode=pd'
+            )
         intrinsics_mode = str(agent_sg_native.get('intrinsics_mode', '')).strip().lower()
-        if intrinsics_mode not in ('', 'hugsim', 'gaia'):
-            raise ValueError("agent_sg_native.intrinsics_mode must be 'hugsim' or 'gaia'")
+        if intrinsics_mode not in ('', 'hugsim', 'gaia', 'pd'):
+            raise ValueError(
+                "agent_sg_native.intrinsics_mode must be 'hugsim', 'gaia', or 'pd'"
+            )
         render_gaia_pinhole_intrinsics = bool(agent_sg_native.get('render_gaia_pinhole_intrinsics', False))
         gaia_pinhole_intrinsic_cameras = agent_sg_native.get('gaia_pinhole_intrinsic_cameras', None)
         if gaia_pinhole_intrinsic_cameras is not None:
             gaia_pinhole_intrinsic_cameras = {str(cam_name) for cam_name in gaia_pinhole_intrinsic_cameras}
         gaia_camera_info_dir = agent_sg_native.get('gaia_camera_info_dir', None)
         gaia_camera_map = agent_sg_native.get('gaia_camera_map', {})
+        fixed_pinhole_intrinsics = dict(
+            agent_sg_native.get('fixed_pinhole_intrinsics', {})
+        )
+        fixed_camera_to_vehicle_hugsim = dict(
+            agent_sg_native.get('fixed_camera_to_vehicle_hugsim', {})
+        )
+        rig_translation_offset_hugsim = np.asarray(
+            agent_sg_native.get(
+                'rig_translation_offset_hugsim', [0.0, 0.0, 0.0]
+            ),
+            dtype=np.float64,
+        )
+        if (
+            rig_translation_offset_hugsim.shape != (3,)
+            or not np.isfinite(rig_translation_offset_hugsim).all()
+        ):
+            raise ValueError(
+                'agent_sg_native.rig_translation_offset_hugsim must be '
+                'three finite numbers'
+            )
+        # Pi3X reconstruction is expressed in the physical front-wide camera
+        # frame, while the PD rig has its own vehicle mount.  Match only the
+        # lateral mount coordinate at frame zero: this preserves the PD
+        # height, forward position, rotations, and all inter-camera baselines.
+        align_pd_rig_lateral_to_dataset_front = bool(
+            agent_sg_native.get('align_pd_rig_lateral_to_dataset_front', False)
+        )
+        pd_lateral_alignment = None
+        if (
+            use_pd_rig
+            and align_pd_rig_lateral_to_dataset_front
+            and not anchor_virtual_rig_to_dataset_front
+        ):
+            dataset_front_right = float(
+                np.asarray(front_cam.extrinsic, dtype=np.float64)[0, 3]
+            )
+            pd_front_right = float(
+                PD_NX_1DAT_CAMERA_TO_VEHICLE_HUGSIM['CAM_FRONT'][0, 3]
+                + rig_translation_offset_hugsim[0]
+            )
+            lateral_delta = dataset_front_right - pd_front_right
+            rig_translation_offset_hugsim[0] += lateral_delta
+            pd_lateral_alignment = (
+                dataset_front_right,
+                pd_front_right,
+                lateral_delta,
+                float(rig_translation_offset_hugsim[0]),
+            )
+        if fixed_camera_to_vehicle_hugsim:
+            missing_fixed_cameras = set(camera_names) - set(
+                fixed_camera_to_vehicle_hugsim
+            )
+            if missing_fixed_cameras:
+                raise ValueError(
+                    'fixed_camera_to_vehicle_hugsim must cover every requested '
+                    f'camera; missing={sorted(missing_fixed_cameras)}'
+                )
+            fixed_camera_to_vehicle_hugsim = {
+                str(name): _load_fixed_camera_to_vehicle_hugsim(value, str(name))
+                for name, value in fixed_camera_to_vehicle_hugsim.items()
+            }
         if intrinsics_mode == 'gaia':
             uses_gaia_intrinsics = True
+            uses_pd_intrinsics = False
             gaia_pinhole_intrinsic_cameras = None
+        elif intrinsics_mode == 'pd':
+            uses_gaia_intrinsics = False
+            uses_pd_intrinsics = True
         elif intrinsics_mode == 'hugsim':
             uses_gaia_intrinsics = False
+            uses_pd_intrinsics = False
         else:
             uses_gaia_intrinsics = render_gaia_pinhole_intrinsics
+            uses_pd_intrinsics = False
         if use_gaia_rig or uses_gaia_intrinsics:
             if gaia_camera_info_dir is None:
                 raise ValueError(
@@ -1042,7 +1178,33 @@ class HUGSimEnv(gymnasium.Env):
             )
             if use_gaia_pinhole_intrinsic:
                 intrinsic = _load_gaia_pinhole_intrinsic(gaia_camera_info_dir, gaia_name, image_size)
-            if use_gaia_rig and gaia_name is not None:
+            if uses_pd_intrinsics:
+                if cam_name not in PD_NX_1DAT_PINHOLE_INTRINSICS:
+                    raise ValueError(
+                        f'PD NX_1DAT has no intrinsic for {cam_name}'
+                    )
+                intrinsic = _load_fixed_pinhole_intrinsic(
+                    PD_NX_1DAT_PINHOLE_INTRINSICS[cam_name], image_size
+                )
+            # An explicit per-camera K is the final render contract.  In
+            # particular this lets a rectified/pinhole tele override the raw
+            # PD fisheye calibration when the renderer has no fisheye lens.
+            use_fixed_pinhole_intrinsic = cam_name in fixed_pinhole_intrinsics
+            if use_fixed_pinhole_intrinsic:
+                intrinsic = _load_fixed_pinhole_intrinsic(
+                    fixed_pinhole_intrinsics[cam_name], image_size
+                )
+            if use_pd_rig:
+                if cam_name not in PD_NX_1DAT_CAMERA_TO_VEHICLE_HUGSIM:
+                    raise ValueError(
+                        f'PD NX_1DAT has no extrinsic for {cam_name}'
+                    )
+                front_camera_pose = PD_NX_1DAT_CAMERA_TO_VEHICLE_HUGSIM[
+                    'CAM_FRONT'
+                ]
+                camera_pose = PD_NX_1DAT_CAMERA_TO_VEHICLE_HUGSIM[cam_name]
+                cam_to_front = np.linalg.inv(front_camera_pose) @ camera_pose
+            elif use_gaia_rig and gaia_name is not None:
                 cam_to_front = front_pose_sv @ np.linalg.inv(gaia_pose_sv[gaia_name])
             else:
                 cam_to_front = np.linalg.inv(front_c2w) @ cam_c2w
@@ -1056,6 +1218,8 @@ class HUGSimEnv(gymnasium.Env):
                     callable(getattr(
                         self.sg_backend, 'camera_intrinsic_at_time', None))
                     and not use_gaia_pinhole_intrinsic
+                    and not uses_pd_intrinsics
+                    and not use_fixed_pinhole_intrinsic
                 ),
             }
             if use_gaia_rig and gaia_name is not None:
@@ -1065,7 +1229,88 @@ class HUGSimEnv(gymnasium.Env):
                     pose_sv_to_hugsim_cam_to_vehicle(pose_sv)
                 )
                 cam_params[cam_name]['agent_cam_to_vehicle'] = np.linalg.inv(pose_sv)
-            if use_gaia_pinhole_intrinsic:
+                if anchor_virtual_rig_to_dataset_front:
+                    # The episode may only reconstruct CAM_FRONT. Preserve
+                    # GAIA's relative virtual-camera layout, but attach it to
+                    # the dataset's actual front camera instead of GAIA's
+                    # absolute simulator mounting position.
+                    anchored_cam_to_vehicle = (
+                        np.asarray(front_cam.extrinsic, dtype=np.float64)
+                        @ cam_to_front
+                    )
+                    cam_params[cam_name]['vehicle_to_camera'] = (
+                        anchored_cam_to_vehicle
+                    )
+                    anchored_pose_sv = hugsim_cam_to_vehicle_to_pose_sv(
+                        anchored_cam_to_vehicle
+                    )
+                    cam_params[cam_name]['pose_SV'] = anchored_pose_sv
+                    cam_params[cam_name]['agent_cam_to_vehicle'] = np.linalg.inv(
+                        anchored_pose_sv
+                    )
+                # Apply a common vehicle-frame translation without changing
+                # GAIA's rotations or inter-camera baselines.  This is used
+                # when the virtual rig must retain GAIA/PAI calibration while
+                # matching the physical camera height of another vehicle.
+                if np.any(rig_translation_offset_hugsim):
+                    translated_cam_to_vehicle = np.asarray(
+                        cam_params[cam_name]['vehicle_to_camera'],
+                        dtype=np.float64,
+                    ).copy()
+                    translated_cam_to_vehicle[:3, 3] += (
+                        rig_translation_offset_hugsim
+                    )
+                    translated_pose_sv = hugsim_cam_to_vehicle_to_pose_sv(
+                        translated_cam_to_vehicle
+                    )
+                    cam_params[cam_name]['vehicle_to_camera'] = (
+                        translated_cam_to_vehicle
+                    )
+                    cam_params[cam_name]['pose_SV'] = translated_pose_sv
+                    cam_params[cam_name]['agent_cam_to_vehicle'] = np.linalg.inv(
+                        translated_pose_sv
+                    )
+            if use_pd_rig:
+                if anchor_virtual_rig_to_dataset_front:
+                    # Attach the whole PD rig to the reconstruction camera.
+                    # CAM_FRONT becomes exactly the source camera; every other
+                    # camera keeps its PD camera-to-front relative transform.
+                    camera_pose = (
+                        np.asarray(front_cam.extrinsic, dtype=np.float64)
+                        @ cam_to_front
+                    )
+                else:
+                    camera_pose = camera_pose.copy()
+                camera_pose = camera_pose.copy()
+                camera_pose[:3, 3] += rig_translation_offset_hugsim
+                pose_sv = hugsim_cam_to_vehicle_to_pose_sv(camera_pose)
+                cam_params[cam_name].update(
+                    vehicle_to_camera=camera_pose,
+                    pose_SV=pose_sv,
+                    agent_cam_to_vehicle=np.linalg.inv(pose_sv),
+                )
+            fixed_camera_pose = fixed_camera_to_vehicle_hugsim.get(cam_name)
+            if fixed_camera_pose is not None:
+                fixed_front_pose = fixed_camera_to_vehicle_hugsim['CAM_FRONT']
+                fixed_cam_to_front = (
+                    np.linalg.inv(fixed_front_pose) @ fixed_camera_pose
+                )
+                fixed_v2c = np.linalg.inv(fixed_cam_to_front)
+                fixed_pose_sv = hugsim_cam_to_vehicle_to_pose_sv(
+                    fixed_camera_pose
+                )
+                cam_params[cam_name].update(
+                    v2c=fixed_v2c,
+                    l2c=fixed_v2c.copy(),
+                    vehicle_to_camera=fixed_camera_pose.copy(),
+                    pose_SV=fixed_pose_sv,
+                    agent_cam_to_vehicle=np.linalg.inv(fixed_pose_sv),
+                )
+            if (
+                use_gaia_pinhole_intrinsic
+                or uses_pd_intrinsics
+                or use_fixed_pinhole_intrinsic
+            ):
                 cam_params[cam_name]['camera_model'] = 'PINHOLE'
                 cam_params[cam_name]['distortion'] = np.zeros(0, dtype=np.float32)
             is_alpasim_scene = getattr(self.sg_backend, 'dataset_type', '') == 'alpasim'
@@ -1098,6 +1343,48 @@ class HUGSimEnv(gymnasium.Env):
                     cam_params[cam_name]['pose_SV'] = pose_sv
                     agent_cam_to_vehicle = np.linalg.inv(pose_sv)
                 cam_params[cam_name]['agent_cam_to_vehicle'] = agent_cam_to_vehicle
+
+        if use_pd_rig or uses_pd_intrinsics:
+            if pd_lateral_alignment is not None:
+                (dataset_right, pd_right_before, delta, final_offset) = (
+                    pd_lateral_alignment
+                )
+                print(
+                    '[HUGSim] PD lateral alignment (frame-0): '
+                    f'reconstruction front right={dataset_right:.6f}m; '
+                    f'PD front right(before)={pd_right_before:.6f}m; '
+                    f'delta={delta:+.6f}m; '
+                    f'rig offset x={final_offset:+.6f}m',
+                    flush=True,
+                )
+            for cam_name in camera_names:
+                params = cam_params[cam_name]
+                intrinsic = params['intrinsic']
+                camera_pose = params.get('vehicle_to_camera')
+                pose_text = 'dataset-relative'
+                if camera_pose is not None:
+                    translation = np.asarray(camera_pose, dtype=np.float64)[:3, 3]
+                    pose_text = (
+                        f'right={translation[0]:.3f}m '
+                        f'height={-translation[1]:.3f}m '
+                        f'forward={translation[2]:.3f}m'
+                    )
+                fx = 0.5 * float(intrinsic['W']) / math.tan(
+                    0.5 * float(intrinsic['fovx'])
+                )
+                fy = 0.5 * float(intrinsic['H']) / math.tan(
+                    0.5 * float(intrinsic['fovy'])
+                )
+                print(
+                    '[HUGSim] PD render camera '
+                    f'{cam_name} K=({fx:.2f},{fy:.2f},'
+                    f'{float(intrinsic["cx"]):.2f},'
+                    f'{float(intrinsic["cy"]):.2f}) '
+                    f'size={int(intrinsic["W"])}x{int(intrinsic["H"])} '
+                    f'{pose_text} dynamic_K='
+                    f'{bool(params.get("dynamic_intrinsics", False))}',
+                    flush=True,
+                )
 
         # Waymo perception SG scenes have no rear training camera. Keep a
         # black rear slot with a valid placeholder K/extrinsic so drivoR's
@@ -1393,6 +1680,7 @@ class HUGSimEnv(gymnasium.Env):
         share — we drop it from the c2w we hand to SG so the resulting view
         sits at the actual cam pose, not 30 cm offset in the rect axis."""
         rgbs, semantics, depths = {}, {}, {}
+        render_requests = []
         v2front = self.cam_params['CAM_FRONT']['v2c']
         for cam_name, params in self.cam_params.items():
             intrinsic = params['intrinsic']
@@ -1418,23 +1706,47 @@ class HUGSimEnv(gymnasium.Env):
                     c2front_no_rect = v2front @ np.linalg.inv(v2c)
                     c2w = self.ego @ c2front_no_rect
 
-                rgb = self.sg_backend.render(
-                    c2w_hugsim=c2w,
-                    ego_c2w_hugsim=self.ego,
-                    intrinsic=intrinsic,
-                    cam_name=cam_name,
-                    timestamp=self.timestamp,
-                )
+                render_requests.append({
+                    'cam_name': cam_name,
+                    'c2w_hugsim': c2w,
+                    'ego_c2w_hugsim': self.ego,
+                    'intrinsic': intrinsic,
+                })
+                rgb = None
             else:
                 rgb = None
-            if rgb is None:
-                rgb = np.zeros((H, W, 3), dtype=np.uint8)
-            rgbs[cam_name] = rgb
             # SG doesn't expose drivable-area semantics or metric depth in
             # the public render path, so zero these out — drivoR / LTF /
             # UniAD agents only read 'rgb'.
             semantics[cam_name] = np.zeros((H, W), dtype=np.uint8)
             depths[cam_name] = np.zeros((H, W), dtype=np.float32)
+            if not params.get('sg_render', True):
+                rgbs[cam_name] = np.zeros((H, W, 3), dtype=np.uint8)
+
+        render_batch = getattr(self.sg_backend, 'render_batch', None)
+        if callable(render_batch) and len(render_requests) > 1:
+            batch_rgbs = render_batch(render_requests, self.timestamp)
+        else:
+            batch_rgbs = {
+                request['cam_name']: self.sg_backend.render(
+                    c2w_hugsim=request['c2w_hugsim'],
+                    ego_c2w_hugsim=request['ego_c2w_hugsim'],
+                    intrinsic=request['intrinsic'],
+                    cam_name=request['cam_name'],
+                    timestamp=self.timestamp,
+                )
+                for request in render_requests
+            }
+        for request in render_requests:
+            cam_name = request['cam_name']
+            intrinsic = request['intrinsic']
+            rgb = batch_rgbs.get(cam_name)
+            if rgb is None:
+                rgb = np.zeros(
+                    (int(intrinsic['H']), int(intrinsic['W']), 3),
+                    dtype=np.uint8,
+                )
+            rgbs[cam_name] = rgb
         return {'rgb': rgbs, 'semantic': semantics, 'depth': depths}
     
     def _get_info(self):

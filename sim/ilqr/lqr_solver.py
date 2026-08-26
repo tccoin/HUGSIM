@@ -263,6 +263,10 @@ class ILQRSolver:
         # Define input clip limits once to avoid recomputation in _clip_inputs.
         self._input_clip_min = (-max_acceleration, -max_steering_angle_rate)
         self._input_clip_max = (max_acceleration, max_steering_angle_rate)
+        # Closed-loop plans are a receding horizon: the previous solution,
+        # shifted by one control, is normally much closer to the next optimum
+        # than rebuilding every solve from scratch.
+        self._previous_input_trajectory: Optional[DoubleMatrix] = None
 
     def solve(self, current_state: DoubleMatrix, reference_trajectory: DoubleMatrix) -> List[ILQRSolution]:
         """
@@ -286,8 +290,35 @@ class ILQRSolver:
         # List of ILQRSolution results where the index corresponds to the iteration of iLQR.
         solution_list: List[ILQRSolution] = []
 
-        # Get warm start input and state trajectory, as well as associated Jacobians.
-        current_iterate = self._input_warm_start(current_state, reference_trajectory)
+        # Reuse the preceding receding-horizon solution when its shape still
+        # matches. Inputs are ego-frame invariant, and forward dynamics rebuild
+        # all state/Jacobian terms from the current state. The analytical warm
+        # start remains the first-call and shape-change fallback.
+        expected_input_shape = (reference_trajectory_length - 1, self._n_inputs)
+        if (
+            self._previous_input_trajectory is not None
+            and self._previous_input_trajectory.shape == expected_input_shape
+            and np.all(np.isfinite(self._previous_input_trajectory))
+        ):
+            shifted_inputs = np.concatenate(
+                (
+                    self._previous_input_trajectory[1:],
+                    self._previous_input_trajectory[-1:],
+                ),
+                axis=0,
+            )
+            current_iterate = self._run_forward_dynamics(
+                current_state,
+                np.clip(
+                    shifted_inputs,
+                    self._input_clip_min,
+                    self._input_clip_max,
+                ),
+            )
+        else:
+            current_iterate = self._input_warm_start(
+                current_state, reference_trajectory
+            )
 
         # Main iLQR Loop.
         solve_start_time = time.perf_counter()
@@ -345,6 +376,8 @@ class ILQRSolver:
                 tracking_cost=tracking_cost,
             )
         )
+
+        self._previous_input_trajectory = current_iterate.input_trajectory.copy()
 
         return solution_list
 

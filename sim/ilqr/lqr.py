@@ -21,6 +21,13 @@ def _max_iterations_from_env():
         raise ValueError("HUGSIM_ILQR_MAX_ITERATIONS must be positive")
     return value
 
+
+def _convergence_threshold_from_env():
+    value = float(os.environ.get("HUGSIM_ILQR_CONVERGENCE_THRESHOLD", "0.05"))
+    if value <= 0.0:
+        raise ValueError("HUGSIM_ILQR_CONVERGENCE_THRESHOLD must be positive")
+    return value
+
 solver_params = ILQRSolverParameters(
     discretization_time=0.5,
     state_cost_diagonal_entries=[1.0, 1.0, 10.0, 0.0, 0.0],
@@ -28,7 +35,11 @@ solver_params = ILQRSolverParameters(
     state_trust_region_entries=[1.0] * 5,
     input_trust_region_entries=[1.0] * 2,
     max_ilqr_iterations=_max_iterations_from_env(),
-    convergence_threshold=1e-6,
+    # The old 1e-6 threshold made every online solve run into the 50 ms time
+    # cap even after the tracking cost and first control had stopped changing
+    # materially.  A 0.05 L2 input-update threshold typically converges in
+    # 8-10 iterations, while retaining a hard wall-clock guard below.
+    convergence_threshold=_convergence_threshold_from_env(),
     max_solve_time=_max_solve_time_from_env(),
     max_acceleration=3.0,
     max_steering_angle=np.pi / 3.0,
