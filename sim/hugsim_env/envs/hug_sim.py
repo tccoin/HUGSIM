@@ -534,7 +534,24 @@ class HUGSimEnv(gymnasium.Env):
         uhv_local[1] = 0
         uhv_world = nearest_c2w[:3, :3] @ uhv_local + nearest_c2w[:3, 3]
         
-        return uhv_world[1]
+        trajectory_height = float(uhv_world[1])
+        # InstantGSWorld exposes a static-Gaussian surface probe. The route
+        # height remains the continuity prior, while the probe lets a closed-
+        # loop ego follow local grades and cross-slopes instead of intersecting
+        # a globally flat trajectory sheet.
+        surface_height = None
+        if self.sg_backend is not None:
+            measure = getattr(self.sg_backend, 'ground_surface_height_hugsim', None)
+            if callable(measure):
+                try:
+                    surface_height = measure(float(u), float(v), trajectory_height)
+                except Exception:
+                    surface_height = None
+        return (
+            trajectory_height
+            if surface_height is None or not np.isfinite(surface_height)
+            else float(surface_height)
+        )
 
     @staticmethod
     def _fit_plane(points):
