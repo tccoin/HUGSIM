@@ -16,6 +16,7 @@ import json
 from sim.utils.plan import planner, UnifiedMap
 from omegaconf import OmegaConf
 import math
+import time
 from gaussian_renderer import GaussianModel
 from scene.obj_model import ObjModel
 from gaussian_renderer import render
@@ -142,6 +143,13 @@ def fg_collision_det(ego_box, objs):
 class HUGSimEnv(gymnasium.Env):
     def __init__(self, cfg, output):
         super().__init__()
+
+        self._runtime_probe_totals_s = {}
+        self._runtime_probe_counts = {}
+        self._ground_height_cache_timestamp = None
+        self._ground_height_cache = {}
+        self._sg_start_pose_cache = {}
+        self._sg_zero_observation_buffers = {}
 
         plan_list = cfg.scenario.plan_list
         for control_param in plan_list:
@@ -522,6 +530,17 @@ class HUGSimEnv(gymnasium.Env):
         self.timestamp = 0
     
     def ground_height(self, u, v):
+        probe_started = time.monotonic()
+        cache_timestamp = float(self.timestamp)
+        if self._ground_height_cache_timestamp != cache_timestamp:
+            self._ground_height_cache_timestamp = cache_timestamp
+            self._ground_height_cache.clear()
+        cache_key = (float(u), float(v))
+        cached = self._ground_height_cache.get(cache_key)
+        if cached is not None:
+            self._record_runtime_probe('ground_height_cache_hit', 0.0)
+            self._record_runtime_probe('ground_height', time.monotonic() - probe_started)
+            return cached
         cam_poses, cam_height, _ = self.ground_model
         cam_dist = np.sqrt(
             (cam_poses[:, 0, 3] - u)**2 + (cam_poses[:, 2, 3] - v)**2
@@ -543,15 +562,21 @@ class HUGSimEnv(gymnasium.Env):
         if self.sg_backend is not None:
             measure = getattr(self.sg_backend, 'ground_surface_height_hugsim', None)
             if callable(measure):
+                surface_started = time.monotonic()
                 try:
                     surface_height = measure(float(u), float(v), trajectory_height)
                 except Exception:
                     surface_height = None
-        return (
+                self._record_runtime_probe(
+                    'ground_surface_query', time.monotonic() - surface_started)
+        result = (
             trajectory_height
             if surface_height is None or not np.isfinite(surface_height)
             else float(surface_height)
         )
+        self._ground_height_cache[cache_key] = result
+        self._record_runtime_probe('ground_height', time.monotonic() - probe_started)
+        return result
 
     @staticmethod
     def _fit_plane(points):
@@ -888,9 +913,16 @@ class HUGSimEnv(gymnasium.Env):
 
     def _set_sg_state_at_time(self, t_sec, fps=10.0):
         pose_at = getattr(self.sg_backend, 'ego_pose_at_time_hugsim', None)
-        if self._use_exact_ego_pose and callable(pose_at):
+        use_backend_runtime_pose = (
+            self._use_exact_ego_pose
+            or getattr(self.sg_backend, 'dataset_type', '')
+            in ('alpasim', 'instant_gs_world')
+        )
+        if use_backend_runtime_pose and callable(pose_at):
             ego_pose = np.asarray(pose_at(float(t_sec)), dtype=np.float64)
-            self._exact_ego_pose = ego_pose.copy()
+            self._exact_ego_pose = (
+                ego_pose.copy() if self._use_exact_ego_pose else None
+            )
             pos = ego_pose[:3, 3]
             fwd = ego_pose[:3, 2]
             vab = np.array([pos[0], pos[2]], dtype=np.float64)
@@ -1075,6 +1107,24 @@ class HUGSimEnv(gymnasium.Env):
                 'agent_sg_native.rig_translation_offset_hugsim must be '
                 'three finite numbers'
             )
+        pd_inverse_extrinsic_scale = 1.0
+        if use_pd_rig:
+            scale_contract = getattr(
+                self.sg_backend, 'camera_height_scale_contract', None
+            )
+            if callable(scale_contract):
+                scale_mode, scale_factor, source_height_m, target_height_m = (
+                    scale_contract()
+                )
+                if str(scale_mode) == 'inverse_extrinsics':
+                    pd_inverse_extrinsic_scale = 1.0 / float(scale_factor)
+                    print(
+                        '[HUGSim] PD inverse-extrinsic height scale '
+                        f'source={float(source_height_m):.3f}m '
+                        f'target={float(target_height_m):.3f}m '
+                        f'rig_translation_scale={pd_inverse_extrinsic_scale:.3f}',
+                        flush=True,
+                    )
         # Pi3X reconstruction is expressed in the physical front-wide camera
         # frame, while the PD rig has its own vehicle mount.  Match only the
         # lateral mount coordinate at frame zero: this preserves the PD
@@ -1300,12 +1350,31 @@ class HUGSimEnv(gymnasium.Env):
                     camera_pose = camera_pose.copy()
                 camera_pose = camera_pose.copy()
                 camera_pose[:3, 3] += rig_translation_offset_hugsim
+                if pd_inverse_extrinsic_scale != 1.0:
+                    front_camera_pose = np.asarray(
+                        PD_NX_1DAT_CAMERA_TO_VEHICLE_HUGSIM['CAM_FRONT'],
+                        dtype=np.float64,
+                    ).copy()
+                    front_camera_pose[:3, 3] += rig_translation_offset_hugsim
+                    camera_pose[:3, 3] = (
+                        front_camera_pose[:3, 3]
+                        + pd_inverse_extrinsic_scale
+                        * (camera_pose[:3, 3] - front_camera_pose[:3, 3])
+                    )
                 pose_sv = hugsim_cam_to_vehicle_to_pose_sv(camera_pose)
                 cam_params[cam_name].update(
                     vehicle_to_camera=camera_pose,
                     pose_SV=pose_sv,
                     agent_cam_to_vehicle=np.linalg.inv(pose_sv),
                 )
+                scaled_cam_to_front = (
+                    np.linalg.inv(front_camera_pose) @ camera_pose
+                    if pd_inverse_extrinsic_scale != 1.0
+                    else cam_to_front
+                )
+                scaled_v2c = np.linalg.inv(scaled_cam_to_front)
+                cam_params[cam_name]['v2c'] = scaled_v2c
+                cam_params[cam_name]['l2c'] = scaled_v2c.copy()
             fixed_camera_pose = fixed_camera_to_vehicle_hugsim.get(cam_name)
             if fixed_camera_pose is not None:
                 fixed_front_pose = fixed_camera_to_vehicle_hugsim['CAM_FRONT']
@@ -1429,18 +1498,29 @@ class HUGSimEnv(gymnasium.Env):
             vr[1]  = yaw, CW-positive from +z toward +x
         """
         assert self.sg_backend is not None, "sg_start_pose_at_time requires SG mode"
+        cache_key = (round(float(t_sec), 9), round(float(fps), 9))
+        cached = self._sg_start_pose_cache.get(cache_key)
+        if cached is not None:
+            return cached[0].copy(), cached[1].copy()
         pose_at = getattr(self.sg_backend, 'ego_pose_at_time_hugsim', None)
         sgb = self.sg_backend
-        is_alpasim_scene = getattr(sgb, 'dataset_type', '') == 'alpasim'
-        if (self._use_exact_ego_pose or is_alpasim_scene) and callable(pose_at):
+        use_backend_runtime_pose = (
+            self._use_exact_ego_pose
+            or getattr(sgb, 'dataset_type', '')
+            in ('alpasim', 'instant_gs_world')
+        )
+        if use_backend_runtime_pose and callable(pose_at):
             ego_pose = np.asarray(pose_at(float(t_sec)), dtype=np.float64)
             pos = ego_pose[:3, 3]
             fwd = ego_pose[:3, 2]
-            return (
+            result = (
                 np.array([pos[0], pos[2]], dtype=np.float64),
                 np.array([0.0, math.atan2(float(fwd[0]), float(fwd[2])), 0.0],
                          dtype=np.float64),
             )
+            self._sg_start_pose_cache[cache_key] = (
+                result[0].copy(), result[1].copy())
+            return result
         if is_alpasim_scene:
             raise RuntimeError(
                 'AlpaSim scene requires ego_pose_at_time_hugsim to derive '
@@ -1489,7 +1569,12 @@ class HUGSimEnv(gymnasium.Env):
         """Estimate logged ego speed at ``t_sec`` from adjacent SG front poses."""
         assert self.sg_backend is not None, "sg_log_speed_at_time requires SG mode"
         pose_at = getattr(self.sg_backend, 'ego_pose_at_time_hugsim', None)
-        if (self._use_exact_ego_pose or getattr(self.sg_backend, 'dataset_type', '') == 'alpasim') and callable(pose_at):
+        use_backend_runtime_pose = (
+            self._use_exact_ego_pose
+            or getattr(self.sg_backend, 'dataset_type', '')
+            in ('alpasim', 'instant_gs_world')
+        )
+        if use_backend_runtime_pose and callable(pose_at):
             t = float(t_sec)
             dt = 1.0 / float(fps)
             t0 = max(0.0, t - dt)
@@ -1696,9 +1781,13 @@ class HUGSimEnv(gymnasium.Env):
         a rendering-time rectification that SG's training data does not
         share — we drop it from the c2w we hand to SG so the resulting view
         sits at the actual cam pose, not 30 cm offset in the rect axis."""
+        obs_started = time.monotonic()
+        prepare_started = obs_started
         rgbs, semantics, depths = {}, {}, {}
         render_requests = []
         v2front = self.cam_params['CAM_FRONT']['v2c']
+        ego_pose = np.asarray(self.ego, dtype=np.float64)
+        ego_w2v = np.linalg.inv(ego_pose)
         for cam_name, params in self.cam_params.items():
             intrinsic = params['intrinsic']
             if params.get('dynamic_intrinsics', False):
@@ -1718,15 +1807,36 @@ class HUGSimEnv(gymnasium.Env):
                 # NO cam_rect for SG — SG was trained on raw cam poses.
                 vehicle_to_camera = params.get('vehicle_to_camera')
                 if vehicle_to_camera is not None:
-                    c2w = self.ego @ np.asarray(vehicle_to_camera, dtype=np.float64)
+                    c2w = ego_pose @ np.asarray(vehicle_to_camera, dtype=np.float64)
                 else:
                     c2front_no_rect = v2front @ np.linalg.inv(v2c)
-                    c2w = self.ego @ c2front_no_rect
+                    c2w = ego_pose @ c2front_no_rect
+
+                runtime_camera_pose = getattr(
+                    self.sg_backend, 'runtime_camera_pose_hugsim', None)
+                if callable(runtime_camera_pose):
+                    effective_c2w = np.asarray(
+                        runtime_camera_pose(c2w, ego_pose, self.timestamp),
+                        dtype=np.float64,
+                    )
+                    effective_camera_to_vehicle = (
+                        ego_w2v @ effective_c2w
+                    )
+                    effective_pose_sv = hugsim_cam_to_vehicle_to_pose_sv(
+                        effective_camera_to_vehicle
+                    )
+                    # Keep the nominal mount for the next render request. Only
+                    # the planner-facing calibration follows the effective
+                    # camera pose used by the backend.
+                    params['pose_SV'] = effective_pose_sv
+                    params['agent_cam_to_vehicle'] = np.linalg.inv(
+                        effective_pose_sv
+                    )
 
                 render_requests.append({
                     'cam_name': cam_name,
                     'c2w_hugsim': c2w,
-                    'ego_c2w_hugsim': self.ego,
+                    'ego_c2w_hugsim': ego_pose,
                     'intrinsic': intrinsic,
                 })
                 rgb = None
@@ -1735,11 +1845,24 @@ class HUGSimEnv(gymnasium.Env):
             # SG doesn't expose drivable-area semantics or metric depth in
             # the public render path, so zero these out — drivoR / LTF /
             # UniAD agents only read 'rgb'.
-            semantics[cam_name] = np.zeros((H, W), dtype=np.uint8)
-            depths[cam_name] = np.zeros((H, W), dtype=np.float32)
+            zero_buffers = self._sg_zero_observation_buffers.get((H, W))
+            if zero_buffers is None:
+                zero_semantic = np.zeros((H, W), dtype=np.uint8)
+                zero_depth = np.zeros((H, W), dtype=np.float32)
+                zero_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+                zero_semantic.flags.writeable = False
+                zero_depth.flags.writeable = False
+                zero_rgb.flags.writeable = False
+                zero_buffers = (zero_semantic, zero_depth, zero_rgb)
+                self._sg_zero_observation_buffers[(H, W)] = zero_buffers
+            semantics[cam_name] = zero_buffers[0]
+            depths[cam_name] = zero_buffers[1]
             if not params.get('sg_render', True):
-                rgbs[cam_name] = np.zeros((H, W, 3), dtype=np.uint8)
+                rgbs[cam_name] = zero_buffers[2]
 
+        self._record_runtime_probe(
+            'obs_prepare_requests', time.monotonic() - prepare_started)
+        render_started = time.monotonic()
         render_batch = getattr(self.sg_backend, 'render_batch', None)
         if callable(render_batch) and len(render_requests) > 1:
             batch_rgbs = render_batch(render_requests, self.timestamp)
@@ -1754,6 +1877,8 @@ class HUGSimEnv(gymnasium.Env):
                 )
                 for request in render_requests
             }
+        self._record_runtime_probe('obs_render', time.monotonic() - render_started)
+        pack_started = time.monotonic()
         for request in render_requests:
             cam_name = request['cam_name']
             intrinsic = request['intrinsic']
@@ -1764,6 +1889,8 @@ class HUGSimEnv(gymnasium.Env):
                     dtype=np.uint8,
                 )
             rgbs[cam_name] = rgb
+        self._record_runtime_probe('obs_pack', time.monotonic() - pack_started)
+        self._record_runtime_probe('obs_total', time.monotonic() - obs_started)
         return {'rgb': rgbs, 'semantic': semantics, 'depth': depths}
     
     def _get_info(self):
@@ -1795,8 +1922,31 @@ class HUGSimEnv(gymnasium.Env):
         self.sg_backend = None
         self.gaussians = None
         return super().close()
+
+    def _record_runtime_probe(self, name, elapsed_s):
+        self._runtime_probe_totals_s[name] = (
+            self._runtime_probe_totals_s.get(name, 0.0) + float(elapsed_s)
+        )
+        self._runtime_probe_counts[name] = self._runtime_probe_counts.get(name, 0) + 1
+
+    def runtime_probe_metrics(self):
+        metrics = {}
+        for name, total_s in self._runtime_probe_totals_s.items():
+            count = int(self._runtime_probe_counts.get(name, 0))
+            metrics[name] = {
+                'total_ms': float(total_s * 1000.0),
+                'count': count,
+                'per_call_ms': float(total_s * 1000.0 / max(count, 1)),
+            }
+        return metrics
+
+    def reset_runtime_probes(self):
+        self._runtime_probe_totals_s.clear()
+        self._runtime_probe_counts.clear()
     
     def reset(self, seed=None, options=None):
+        self._ground_height_cache_timestamp = None
+        self._ground_height_cache.clear()
         self._exact_ego_pose = None
         self.vr = deepcopy(self.start_vr)
         self.vab = deepcopy(self.start_vab)
@@ -1817,6 +1967,7 @@ class HUGSimEnv(gymnasium.Env):
         return observation, info
     
     def step(self, action):
+        step_started = time.monotonic()
         self.timestamp += self.dt
         if self.planner is not None:
             self.render_kwargs['planning'] = self.planner.plan_traj(self.timestamp, self.ego_state)
@@ -1831,7 +1982,9 @@ class HUGSimEnv(gymnasium.Env):
         self.vab[1] = self.vab[1] + self.velo * np.cos(theta) * self.dt
         self.vr[1] = theta + self.velo * np.tan(self.steer) / L * self.dt
         self._exact_ego_pose = None
+        self._record_runtime_probe('step_kinematics', time.monotonic() - step_started)
 
+        collision_started = time.monotonic()
         terminated = False
         reward = 0
         verts = (self.ego[:3, :3] @ self.ego_verts.T).T + self.ego[:3, 3]
@@ -1855,7 +2008,10 @@ class HUGSimEnv(gymnasium.Env):
             terminated = True
             print('Collision with foreground')
             reward = -100
+        self._record_runtime_probe(
+            'step_collision', time.monotonic() - collision_started)
 
+        route_started = time.monotonic()
         rc, dist = self.route_completion
         off_route = False
         off_route_threshold = float(getattr(self, 'off_route_threshold', 30.0))
@@ -1874,9 +2030,14 @@ class HUGSimEnv(gymnasium.Env):
             log_complete = bool(float(self.timestamp) >= float(max_log_time) - 1e-6)
         except Exception:
             log_complete = False
+        self._record_runtime_probe('step_route', time.monotonic() - route_started)
 
+        obs_started = time.monotonic()
         observation = self._get_obs()
+        self._record_runtime_probe('step_get_obs', time.monotonic() - obs_started)
+        info_started = time.monotonic()
         info = self._get_info()
+        self._record_runtime_probe('step_get_info', time.monotonic() - info_started)
         info['rc'] = rc
         info['collision']    = bg_collision or fg_collision
         info['bg_collision'] = bool(bg_collision)
@@ -1888,5 +2049,7 @@ class HUGSimEnv(gymnasium.Env):
         info['route_complete'] = bool(route_complete)
         info['log_complete'] = bool(log_complete)
         terminated = bool(terminated or log_complete)
+
+        self._record_runtime_probe('step_total', time.monotonic() - step_started)
 
         return observation, reward, terminated, False, info
