@@ -141,6 +141,12 @@ def fg_collision_det(ego_box, objs):
     return False
 
 class HUGSimEnv(gymnasium.Env):
+    # Set only by the in-process RL actor while it creates replicated vehicle
+    # states.  It is intentionally a class-level construction hook instead
+    # of an OmegaConf field: render backends are live CUDA objects and cannot
+    # be represented safely in a serializable simulation config.
+    _construction_shared_sg_backend = None
+
     def __init__(self, cfg, output):
         super().__init__()
 
@@ -163,6 +169,7 @@ class HUGSimEnv(gymnasium.Env):
         sg_cfg = cfg.get('sg', None) if hasattr(cfg, 'get') else None
         self.sg_enabled = bool(sg_cfg is not None and sg_cfg.get('enabled', False))
         self.sg_backend = None
+        self._owns_sg_backend = True
         self._use_exact_ego_pose = bool(sg_cfg.get('use_exact_ego_pose', False)) if self.sg_enabled else False
         self._use_alpasim_controller_absolute_pose = (
             bool(sg_cfg.get('use_controller_absolute_pose', True))
@@ -203,7 +210,12 @@ class HUGSimEnv(gymnasium.Env):
         else:
             self.gaussians = None  # SG-only mode owns its own gaussians
 
-        if self.sg_enabled:
+        shared_backend = type(self)._construction_shared_sg_backend
+        if self.sg_enabled and shared_backend is not None:
+            self.sg_backend = shared_backend
+            self._owns_sg_backend = False
+
+        if self.sg_enabled and self.sg_backend is None:
             # Initialise external render backend; build derived ground_model.
             # Lazy import so the legacy hugsim env doesn't pay renderer deps at import time.
             import sys
@@ -392,6 +404,14 @@ class HUGSimEnv(gymnasium.Env):
                     sg_data_path=str(sg_cfg.data_path),
                     include_sky=bool(sg_cfg.get('include_sky', False)),
                 )
+            if hasattr(self.sg_backend, 'build_ground_model_hugsim'):
+                self.ground_model = self.sg_backend.build_ground_model_hugsim()
+            else:
+                self.ground_model = self._build_ground_model_from_sg()
+
+        # Borrowed backends still need the per-environment ground/planner
+        # metadata, but must not rebuild or own the CUDA reconstruction.
+        if self.sg_enabled and shared_backend is not None:
             if hasattr(self.sg_backend, 'build_ground_model_hugsim'):
                 self.ground_model = self.sg_backend.build_ground_model_hugsim()
             else:
@@ -1504,6 +1524,7 @@ class HUGSimEnv(gymnasium.Env):
             return cached[0].copy(), cached[1].copy()
         pose_at = getattr(self.sg_backend, 'ego_pose_at_time_hugsim', None)
         sgb = self.sg_backend
+        is_alpasim_scene = getattr(sgb, 'dataset_type', '') == 'alpasim'
         use_backend_runtime_pose = (
             self._use_exact_ego_pose
             or getattr(sgb, 'dataset_type', '')
@@ -1892,32 +1913,178 @@ class HUGSimEnv(gymnasium.Env):
         self._record_runtime_probe('obs_pack', time.monotonic() - pack_started)
         self._record_runtime_probe('obs_total', time.monotonic() - obs_started)
         return {'rgb': rgbs, 'semantic': semantics, 'depth': depths}
+
+    @classmethod
+    def get_obs_batch(cls, envs):
+        """Render synchronized SG episodes sharing one backend in one launch.
+
+        A local RL actor can own several independent vehicle states while
+        reusing one immutable reconstruction.  In that topology each member
+        has the same ``sg_backend`` and timestamp but a different ego pose.
+        Combining their camera requests lets the backend's gsplat camera batch
+        axis cover ``episodes × cameras``.  Environments that do not satisfy
+        this narrow contract keep the exact single-episode implementation.
+
+        The method is intentionally side-effect compatible with
+        :meth:`_get_obs_sg`: dynamic intrinsics and the planner-facing
+        effective camera calibration are refreshed per environment.
+        """
+        if not envs:
+            return []
+        observations = [None] * len(envs)
+        groups = {}
+        for index, env in enumerate(envs):
+            backend = getattr(env, 'sg_backend', None)
+            render_batch = getattr(backend, 'render_batch', None)
+            if backend is None or not callable(render_batch):
+                observations[index] = env._get_obs()
+                continue
+            # All requests in one backend call carry one timestamp. Exact
+            # float equality is appropriate here: synchronized RL stepping
+            # increments the same simulator dt on every live environment.
+            groups.setdefault((id(backend), float(env.timestamp)), []).append(index)
+
+        for (_backend_id, timestamp), indices in groups.items():
+            if len(indices) == 1:
+                index = indices[0]
+                observations[index] = envs[index]._get_obs_sg()
+                continue
+            backend = envs[indices[0]].sg_backend
+            if any(envs[index].sg_backend is not backend for index in indices):
+                raise RuntimeError('SG batch grouping mixed distinct backend instances')
+            batch_started = time.monotonic()
+            render_requests = []
+            per_env = {}
+            for index in indices:
+                env = envs[index]
+                rgbs, semantics, depths = {}, {}, {}
+                v2front = env.cam_params['CAM_FRONT']['v2c']
+                ego_pose = np.asarray(env.ego, dtype=np.float64)
+                ego_w2v = np.linalg.inv(ego_pose)
+                for cam_name, params in env.cam_params.items():
+                    intrinsic = params['intrinsic']
+                    if params.get('dynamic_intrinsics', False):
+                        intrinsic_at_time = getattr(
+                            backend, 'camera_intrinsic_at_time', None)
+                        dynamic_intrinsic = intrinsic_at_time(
+                            env.timestamp,
+                            cam_name,
+                            (int(intrinsic['W']), int(intrinsic['H'])),
+                        ) if callable(intrinsic_at_time) else None
+                        if dynamic_intrinsic is not None:
+                            intrinsic = dynamic_intrinsic
+                            params['intrinsic'] = dynamic_intrinsic
+                    H, W = int(intrinsic['H']), int(intrinsic['W'])
+                    if params.get('sg_render', True):
+                        vehicle_to_camera = params.get('vehicle_to_camera')
+                        if vehicle_to_camera is not None:
+                            c2w = ego_pose @ np.asarray(
+                                vehicle_to_camera, dtype=np.float64)
+                        else:
+                            c2front_no_rect = v2front @ np.linalg.inv(params['v2c'])
+                            c2w = ego_pose @ c2front_no_rect
+                        runtime_camera_pose = getattr(
+                            backend, 'runtime_camera_pose_hugsim', None)
+                        if callable(runtime_camera_pose):
+                            effective_c2w = np.asarray(
+                                runtime_camera_pose(c2w, ego_pose, env.timestamp),
+                                dtype=np.float64,
+                            )
+                            effective_camera_to_vehicle = ego_w2v @ effective_c2w
+                            effective_pose_sv = hugsim_cam_to_vehicle_to_pose_sv(
+                                effective_camera_to_vehicle)
+                            params['pose_SV'] = effective_pose_sv
+                            params['agent_cam_to_vehicle'] = np.linalg.inv(
+                                effective_pose_sv)
+                        result_key = f'{index}:{cam_name}'
+                        render_requests.append({
+                            'cam_name': cam_name,
+                            'result_key': result_key,
+                            'c2w_hugsim': c2w,
+                            'ego_c2w_hugsim': ego_pose,
+                            'intrinsic': intrinsic,
+                        })
+                    else:
+                        result_key = None
+                    zero_buffers = env._sg_zero_observation_buffers.get((H, W))
+                    if zero_buffers is None:
+                        zero_semantic = np.zeros((H, W), dtype=np.uint8)
+                        zero_depth = np.zeros((H, W), dtype=np.float32)
+                        zero_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+                        zero_semantic.flags.writeable = False
+                        zero_depth.flags.writeable = False
+                        zero_rgb.flags.writeable = False
+                        zero_buffers = (zero_semantic, zero_depth, zero_rgb)
+                        env._sg_zero_observation_buffers[(H, W)] = zero_buffers
+                    semantics[cam_name] = zero_buffers[0]
+                    depths[cam_name] = zero_buffers[1]
+                    if result_key is None:
+                        rgbs[cam_name] = zero_buffers[2]
+                per_env[index] = (rgbs, semantics, depths)
+
+            rendered = backend.render_batch(render_requests, timestamp)
+            for index in indices:
+                env = envs[index]
+                rgbs, semantics, depths = per_env[index]
+                for request in render_requests:
+                    result_key = str(request['result_key'])
+                    if not result_key.startswith(f'{index}:'):
+                        continue
+                    cam_name = str(request['cam_name'])
+                    intrinsic = request['intrinsic']
+                    rgb = rendered.get(result_key)
+                    if rgb is None:
+                        rgb = np.zeros(
+                            (int(intrinsic['H']), int(intrinsic['W']), 3),
+                            dtype=np.uint8,
+                        )
+                    rgbs[cam_name] = rgb
+                observations[index] = {
+                    'rgb': rgbs,
+                    'semantic': semantics,
+                    'depth': depths,
+                }
+                env._record_runtime_probe(
+                    'obs_batch_render', time.monotonic() - batch_started)
+        return observations
     
     def _get_info(self):
+        probe_started = time.monotonic()
         wego_r, wego_t = pose2rt(self.ego)
+        self._record_runtime_probe('info_pose', time.monotonic() - probe_started)
+        probe_started = time.monotonic()
         cam_poses, _, commands = self.ground_model
         ego_pos = np.asarray(self.ego, dtype=np.float64)[:3, 3]
         dist = np.sum((cam_poses[:, :3, 3] - ego_pos) ** 2, axis=-1)
         nearest_cam_idx = np.argmin(dist)
         command = commands[nearest_cam_idx]
+        self._record_runtime_probe('info_nearest', time.monotonic() - probe_started)
+        probe_started = time.monotonic()
+        ego_pose = np.asarray(self.ego, dtype=np.float64).tolist()
+        ego_box = self.ego_box
+        self._record_runtime_probe('info_ego_box_pose', time.monotonic() - probe_started)
+        probe_started = time.monotonic()
+        obj_boxes = self.objs_list
+        self._record_runtime_probe('info_actor_boxes', time.monotonic() - probe_started)
         return {
             'ego_pos'  : wego_t.tolist(),
             'ego_rot'  : wego_r.tolist(),
-            'ego_pose_hugsim': np.asarray(self.ego, dtype=np.float64).tolist(),
+            'ego_pose_hugsim': ego_pose,
             'ego_velo' : self.velo,
             'ego_steer': self.steer,
             'accelerate': self.last_accel,
             'steer_rate': self.last_steer_rate,
             'timestamp': self.timestamp,
             'command': command,
-            'ego_box': self.ego_box,
-            'obj_boxes': self.objs_list,
+            'ego_box': ego_box,
+            'obj_boxes': obj_boxes,
             'cam_params': self.cam_params,
             # 'ego_verts': verts,
         }
 
     def close(self):
-        if self.sg_backend is not None and hasattr(self.sg_backend, 'close'):
+        if (self._owns_sg_backend and self.sg_backend is not None
+                and hasattr(self.sg_backend, 'close')):
             self.sg_backend.close()
         self.sg_backend = None
         self.gaussians = None
@@ -1944,7 +2111,7 @@ class HUGSimEnv(gymnasium.Env):
         self._runtime_probe_totals_s.clear()
         self._runtime_probe_counts.clear()
     
-    def reset(self, seed=None, options=None):
+    def reset(self, seed=None, options=None, *, render_observation=True):
         self._ground_height_cache_timestamp = None
         self._ground_height_cache.clear()
         self._exact_ego_pose = None
@@ -1961,12 +2128,12 @@ class HUGSimEnv(gymnasium.Env):
         elif self.planner is not None:
             self.render_kwargs['planning'] = self.planner.plan_traj(self.timestamp, self.ego_state)
 
-        observation = self._get_obs()
+        observation = self._get_obs() if render_observation else None
         info = self._get_info()
 
         return observation, info
     
-    def step(self, action):
+    def step(self, action, *, render_observation=True):
         step_started = time.monotonic()
         self.timestamp += self.dt
         if self.planner is not None:
@@ -1987,11 +2154,11 @@ class HUGSimEnv(gymnasium.Env):
         collision_started = time.monotonic()
         terminated = False
         reward = 0
-        verts = (self.ego[:3, :3] @ self.ego_verts.T).T + self.ego[:3, 3]
-        verts = torch.from_numpy(verts.astype(np.float32)).cuda()
-        
         collision_supported = bool(
             getattr(self.sg_backend, 'collision_supported', True))
+        if collision_supported:
+            verts = (self.ego[:3, :3] @ self.ego_verts.T).T + self.ego[:3, 3]
+            verts = torch.from_numpy(verts.astype(np.float32)).to(self.points.device)
         bg_collision_points = (
             bg_collision_point_count(self.points, verts)
             if collision_supported else 0)
@@ -2033,7 +2200,7 @@ class HUGSimEnv(gymnasium.Env):
         self._record_runtime_probe('step_route', time.monotonic() - route_started)
 
         obs_started = time.monotonic()
-        observation = self._get_obs()
+        observation = self._get_obs() if render_observation else None
         self._record_runtime_probe('step_get_obs', time.monotonic() - obs_started)
         info_started = time.monotonic()
         info = self._get_info()
