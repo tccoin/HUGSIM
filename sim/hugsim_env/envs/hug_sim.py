@@ -25,6 +25,7 @@ import open3d as o3d
 from gs_world.planning_agents.gaia_e2e.camera_geometry import (
     FLU_TO_RDF,
     PD_NX_1DAT_CAMERA_TO_VEHICLE_HUGSIM,
+    PD_NX_1DAT_FISHEYE_RADIAL_COEFFS,
     PD_NX_1DAT_PINHOLE_INTRINSICS,
     hugsim_cam_to_vehicle_to_pose_sv,
     pose_sv_to_hugsim_cam_to_vehicle,
@@ -1110,6 +1111,13 @@ class HUGSimEnv(gymnasium.Env):
         fixed_pinhole_intrinsics = dict(
             agent_sg_native.get('fixed_pinhole_intrinsics', {})
         )
+        pd_lens_model = str(
+            agent_sg_native.get('pd_lens_model', 'pinhole')
+        ).strip().lower()
+        if pd_lens_model not in ('pinhole', 'fisheye'):
+            raise ValueError(
+                "agent_sg_native.pd_lens_model must be 'pinhole' or 'fisheye'"
+            )
         fixed_camera_to_vehicle_hugsim = dict(
             agent_sg_native.get('fixed_camera_to_vehicle_hugsim', {})
         )
@@ -1412,7 +1420,14 @@ class HUGSimEnv(gymnasium.Env):
                     pose_SV=fixed_pose_sv,
                     agent_cam_to_vehicle=np.linalg.inv(fixed_pose_sv),
                 )
-            if (
+            if uses_pd_intrinsics and pd_lens_model == 'fisheye':
+                if cam_name not in PD_NX_1DAT_FISHEYE_RADIAL_COEFFS:
+                    raise ValueError(f'PD NX_1DAT has no fisheye coefficients for {cam_name}')
+                cam_params[cam_name]['camera_model'] = 'FISHEYE'
+                cam_params[cam_name]['distortion'] = np.asarray(
+                    PD_NX_1DAT_FISHEYE_RADIAL_COEFFS[cam_name], dtype=np.float32
+                )
+            elif (
                 use_gaia_pinhole_intrinsic
                 or uses_pd_intrinsics
                 or use_fixed_pinhole_intrinsic
@@ -1488,7 +1503,8 @@ class HUGSimEnv(gymnasium.Env):
                     f'{float(intrinsic["cy"]):.2f}) '
                     f'size={int(intrinsic["W"])}x{int(intrinsic["H"])} '
                     f'{pose_text} dynamic_K='
-                    f'{bool(params.get("dynamic_intrinsics", False))}',
+                    f'{bool(params.get("dynamic_intrinsics", False))} lens='
+                    f'{params.get("camera_model", "PINHOLE")}',
                     flush=True,
                 )
 
@@ -1859,6 +1875,8 @@ class HUGSimEnv(gymnasium.Env):
                     'c2w_hugsim': c2w,
                     'ego_c2w_hugsim': ego_pose,
                     'intrinsic': intrinsic,
+                    'camera_model': params.get('camera_model', 'PINHOLE'),
+                    'distortion': params.get('distortion', np.zeros(0, dtype=np.float32)),
                 })
                 rgb = None
             else:
@@ -2003,6 +2021,8 @@ class HUGSimEnv(gymnasium.Env):
                             'c2w_hugsim': c2w,
                             'ego_c2w_hugsim': ego_pose,
                             'intrinsic': intrinsic,
+                            'camera_model': params.get('camera_model', 'PINHOLE'),
+                            'distortion': params.get('distortion', np.zeros(0, dtype=np.float32)),
                         })
                     else:
                         result_key = None
